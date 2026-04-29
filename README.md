@@ -7,7 +7,7 @@
 
 # kratos-cron
 
-Cron task integration with Kratos framework, wraps robfig/cron as Kratos transport.Server with clean shutdown support.
+Cron task integration with the Kratos framework. Wraps `robfig/cron` as a Kratos `transport.Server` with built-in panic catch, startup execution, plus read-lock protected clean shutdown.
 
 ---
 
@@ -21,11 +21,13 @@ Cron task integration with Kratos framework, wraps robfig/cron as Kratos transpo
 
 ## Main Features
 
-🕐 **Cron Integration**: Wraps robfig/cron as Kratos transport.Server
-🛡️ **Clean Shutdown**: Ensures tasks complete before exit with read-lock protection
-⚡ **Context Safe**: ctx remains valid while holding read lock, prevents mid-execution invalidation
-🔄 **Two Modes**: Basic mode and read-lock protected mode
-📦 **Simple API**: Simple to integrate with existing Kratos applications
+🕐 **Kratos transport.Server** — Plug a cron schedule inline into `kratos.New(kratos.Server(...))`
+🛡️ **Clean shutdown** — Three-step shutdown waits on running tasks before invalidating ctx
+⚡ **Context-safe hot sections** — `Stage.Do` holds a read-lock so ctx stays valid mid-task
+🚀 **Run-once-at-startup** — Task-scope `DoOnStartup()` option, no separate boot hook needed
+🛟 **Opt-in panic catch** — Task-scope `Recoverable()` / service-side `WithRecover()`
+🔁 **Nested-Do deadlock-safe** — Nested `stage.Do` calls auto-detect the holding ctx and skip re-locking
+📦 **Compact surface** — 4 methods (`NewServer` / `AddFunc` / `Start` / `Stop`) + 3 options
 
 ## Installation
 
@@ -33,83 +35,159 @@ Cron task integration with Kratos framework, wraps robfig/cron as Kratos transpo
 go get github.com/yylego/kratos-cron/cronkratos
 ```
 
-## Usage
-
-### Basic Mode (CronServer)
+## Quick Start
 
 ```go
 package main
 
 import (
-    "context"
-    "github.com/go-kratos/kratos/v2/log"
-    "github.com/yylego/kratos-cron/cronkratos"
-    "github.com/robfig/cron/v3"
+	"context"
+	"time"
+
+	"github.com/go-kratos/kratos/v2"
+	"github.com/go-kratos/kratos/v2/log"
+	"github.com/robfig/cron/v3"
+	"github.com/yylego/kratos-cron/cronkratos"
+	"github.com/yylego/must"
+	"github.com/yylego/rese"
 )
 
-type MyCronService struct{}
-
-func (s *MyCronService) RegisterCron(ctx context.Context, c *cron.Cron) {
-    c.AddFunc("* * * * * *", func() {
-        // task logic
-    })
-}
-
 func main() {
-    c := cron.New(cron.WithSeconds())
-    srv := cronkratos.NewServer(c, log.DefaultLogger)
+	c := cron.New(
+		cron.WithSeconds(),
+		cron.WithLocation(time.FixedZone("CST", 8*60*60)),
+	)
 
-    cronkratos.RegisterCronServer(srv, &MyCronService{})
+	slog := log.DefaultLogger
+	srv := cronkratos.NewServer(c, slog, cronkratos.WithRecover())
 
-    srv.Start(context.Background())
-    // ...
-    srv.Stop(context.Background())
+	rese.C1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
+		stage.Do(ctx, func(ctx context.Context) {
+			if ctx.Err() != nil {
+				return
+			}
+			// business logic — ctx stays valid as long as fn runs
+		})
+	}, cronkratos.DoOnStartup()))
+
+	app := kratos.New(kratos.Server(srv))
+	must.Done(app.Run())
 }
 ```
 
-### Protected Mode (CronServerL)
+## Usage
 
-Use read-lock protection to ensure ctx remains valid in execution:
+### 1. Bind a scheduled task
 
 ```go
-type MyCronServiceL struct{}
-
-func (s *MyCronServiceL) RegisterCron(ctx context.Context, c *cron.Cron, locker sync.Locker) {
-    c.AddFunc("* * * * * *", func() {
-        locker.Lock()
-        defer locker.Unlock()
-        if ctx.Err() != nil {
-            return
-        }
-        // task logic - ctx is guaranteed valid here
-    })
-}
-
-func main() {
-    c := cron.New(cron.WithSeconds())
-    srv := cronkratos.NewServer(c, log.DefaultLogger)
-
-    cronkratos.RegisterCronServerL(srv, &MyCronServiceL{})
-
-    srv.Start(context.Background())
-    // ...
-    srv.Stop(context.Background())
-}
+srv.AddFunc("0 */5 * * * *", func(ctx context.Context, stage *cronkratos.Stage) {
+    // runs each 5 minutes
+})
 ```
 
-## Demo
+The `cmd` signature is `func(ctx context.Context, stage *Stage)`. The Server injects its own ctx (cancelled on Stop) plus a shared `*Stage` instance.
 
-See [kratos-cron-demos](https://github.com/yylego/kratos-cron-demos) as complete integration demo with Kratos applications.
+### 2. Run the task once at startup
+
+```go
+srv.AddFunc("0 0 2 * * *", fn, cronkratos.DoOnStartup())
+```
+
+`fn` runs on the cron schedule **and** once in a goroutine when `Server.Start()` is called. Apt when a 2am sweep task should also drain unfinished work on each boot.
+
+### 3. Panic catch
+
+Catch is opt-in (matching Kratos gRPC/HTTP convention). Two ways:
+
+```go
+// Task-scope — wrap one specific task
+srv.AddFunc(spec, fn, cronkratos.Recoverable())
+
+// Service-side — wrap each task added through this Server
+srv := cronkratos.NewServer(c, slog, cronkratos.WithRecover())
+```
+
+The two compose with **OR** semantics: one flag is enough. A task with no flag set runs raw — panics propagate as standard.
+
+### 4. Clean shutdown coordination — `Stage.Do`
+
+Wrap hot sections with `stage.Do(ctx, fn)`:
+
+```go
+srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
+    for _, item := range list {
+        stage.Do(ctx, func(ctx context.Context) {
+            if ctx.Err() != nil {
+                return
+            }
+            process(ctx, item)
+        })
+    }
+})
+```
+
+`stage.Do` acquires the Server's read-lock during `fn`. When `Server.Stop()` runs, it acquires the **write lock** before cancelling ctx — so the write-lock acquisition waits on each in-flight `stage.Do` to return. This guarantees `ctx` stays valid _inside_ the `stage.Do` callback even when Stop is racing.
+
+The lock-each-iteration pattern (above) lets `Stop` slip in between iterations, so a long-running task drains in chunks instead of being killed mid-step.
+
+### 5. Nested `stage.Do` is safe
+
+Aid functions can invoke `stage.Do` again — as long as `ctx` flows through the invocation chain, the nested invocation detects the holding tag on `ctx` and skips re-locking, avoiding the classic `RWMutex` reentrance deadlock with a concurrent `Lock()`:
+
+```go
+stage.Do(ctx, func(ctx context.Context) {
+    helperUsingStage(ctx, stage)  // nested stage.Do sees the tag, skips re-locking
+})
+```
+
+### 6. Plug into Kratos
+
+`*Server` implements `transport.Server` inline:
+
+```go
+app := kratos.New(
+    kratos.Name("app-service"),
+    kratos.Server(httpSrv, grpcSrv, srv),
+)
+```
+
+`Start` and `Stop` are driven via the Kratos lifecycle.
 
 ## Design
 
-The clean shutdown mechanism:
+### Three-step clean shutdown
 
-1. `cron.Stop()` - stop scheduling new tasks
-2. `mutex.Lock()` - get write lock, wait read locks to release
-3. `cancel()` - cancel ctx
+`Server.Stop` runs three steps in sequence:
 
-Since cancel() is invoked following write lock acquisition, and write lock waits read locks, ctx remains valid while holding read lock. This ensures atomic operations - complete execution otherwise exit at checkpoint.
+1. **`cron.Stop()`** — stops scheduling new tasks. Returns a ctx that completes when running cron tasks finish. Listens on `Stop`'s own ctx — on timeout it logs a warn but continues to step 2 (`mutex.Lock` does not check ctx; it waits as long as needed).
+2. **`mutex.Lock()`** — acquires the write lock, waiting on each holding goroutine (active `stage.Do` callbacks) to release.
+3. **`cancel()`** — invalidates the Server's ctx.
+
+Because (3) just fires past (2), and (2) waits on read-lock holders, the ctx checked inside each `stage.Do` callback is guaranteed valid throughout that callback's run. No "ctx cancelled mid-step" surprises.
+
+### Stage.Do — picked instead of a raw mutex
+
+Two reasons:
+
+- **Hides the lock.** Business code does not touch `sync.RWMutex` / `RLocker` / write-lock semantics. The sole API surface is `stage.Do(ctx, fn)`.
+- **Solves nested reentrance.** `sync.RWMutex.RLock` is _not_ reentrant — with a concurrent `Lock`, a second `RLock` on the same goroutine deadlocks (`Lock`-starvation prevention). `Stage.Do` carries a private tag on `ctx`; nested calls see the tag and skip re-locking, eliminating the deadlock.
+
+### What `cronkratos` hides from the business side
+
+| Underlying concern                         | Handled in here                                        |
+| ------------------------------------------ | ------------------------------------------------------ |
+| `cron.Logger` adaptation                   | Wrapped around the Kratos `log.Logger` you pass in     |
+| `cron.WithChain(cron.Recover(...))` wiring | Replaced via `Recoverable()` / `WithRecover()` options |
+| `defer recover()` boilerplate              | Done via `wrapRecoverable` when one flag is set        |
+| `sync.RWMutex` + `RLocker` plumbing        | Encapsulated in `Stage.Do`                             |
+| `context.WithCancel` lifetime              | Created in `NewServer`, cancelled in `Stop`            |
+| Run-once-at-boot bookkeeping               | Driven via `DoOnStartup()` option                      |
+
+The business side sees 4 methods, 3 options, plus the `Stage` type.
+
+## Demo
+
+See [kratos-cron-demos](https://github.com/yylego/kratos-cron-demos) — a complete Kratos integration example.
 
 ---
 
