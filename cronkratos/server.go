@@ -117,7 +117,7 @@ func NewServer(c *cron.Cron, slog log.Logger, opts ...ServerOption) *Server {
 		slog:        log.NewHelper(slog),
 		startupRuns: nil,
 		recoverable: cfg.recoverable,
-		stage:       &Stage{rmu: mutex.RLocker()},
+		stage:       NewStage(mutex.RLocker()),
 	}
 }
 

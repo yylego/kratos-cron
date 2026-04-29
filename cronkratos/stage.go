@@ -15,6 +15,34 @@ type Stage struct {
 	rmu sync.Locker
 }
 
+// NewStage builds a Stage on the given sync.Locker.
+// Server uses NewStage(mutex.RLocker()) inside; on-demand paths that
+// bypass shutdown coordination should invoke NonStage instead.
+//
+// NewStage 用给定的 sync.Locker 构造 Stage
+// Server 内部用 NewStage(mutex.RLocker()); 手动触发等不参与协调的路径请用 NonStage
+func NewStage(rmu sync.Locker) *Stage {
+	return &Stage{rmu: rmu}
+}
+
+// NonStage returns a Stage with no-op lock semantics — apt on on-demand
+// paths that bypass cron Server's shutdown coordination, where the business
+// method's signature requires *Stage but locking is not needed.
+//
+// NonStage 返回一个 noop Stage — 给手动触发等场景用,不参与 cron Server 协调
+// 业务方法签名要求 *Stage 但调用方不需要真正持锁时,直接传 NonStage() 即可
+func NonStage() *Stage {
+	return NewStage(&noopMutex{})
+}
+
+// noopMutex implements sync.Locker with blank Lock/Unlock — supports NonStage.
+//
+// noopMutex 实现 sync.Locker, Lock/Unlock 都是空操作 — 支撑 NonStage
+type noopMutex struct{}
+
+func (*noopMutex) Lock()   {}
+func (*noopMutex) Unlock() {}
+
 // stageHoldingCtxKey tags a ctx as having Stage's read-lock on this
 // invocation chain. Do uses this tag to short-circuit nested invocations and
 // avoid the classic R/W reentrance deadlock with a concurrent Stop.

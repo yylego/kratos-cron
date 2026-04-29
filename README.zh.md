@@ -140,7 +140,19 @@ stage.Do(ctx, func(ctx context.Context) {
 })
 ```
 
-### 6. 跟 Kratos 集成
+### 6. 按需触发路径(`NonStage`)
+
+业务上同一个方法既挂 cron 调度,也通过 RPC 接口按需触发执行(比如 admin 后台点一下立即跑一次)。按需路径拿不到 `*Stage`,这时用 `cronkratos.NonStage()` 拿一个 noop Stage 即可 — 业务方法签名保持干净(`*Stage` 永远不为 nil),按需路径明确不参与优雅退出协调:
+
+```go
+func (s *Service) RunSomething(ctx context.Context) error {
+    return s.runSomething(ctx, cronkratos.NonStage())
+}
+```
+
+少数高级场景需要自定义 `sync.Locker` 时,用 `cronkratos.NewStage(customLock)` — 跟 `Server` 内部用的是同一个构造函数。
+
+### 7. 跟 Kratos 集成
 
 `*Server` 直接实现 `transport.Server` 接口:
 

@@ -140,7 +140,19 @@ stage.Do(ctx, func(ctx context.Context) {
 })
 ```
 
-### 6. Plug into Kratos
+### 6. On-demand paths (`NonStage`)
+
+When the same business method is invoked outside the cron schedule (e.g. an RPC endpoint that runs the job on demand), the invoking code has no `*Stage` to pass in. Use `cronkratos.NonStage()` to get a no-op Stage — the business method's signature stays clean (`*Stage` is non-nil), and the on-demand path skips shutdown coordination on purpose:
+
+```go
+func (s *Service) RunSomething(ctx context.Context) error {
+    return s.runSomething(ctx, cronkratos.NonStage())
+}
+```
+
+When advanced cases need a custom `sync.Locker`, use `cronkratos.NewStage(customLock)` — the same approach `Server` uses inside.
+
+### 7. Plug into Kratos
 
 `*Server` implements `transport.Server` inline:
 
