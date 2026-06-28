@@ -12,7 +12,7 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: stable
@@ -29,7 +29,7 @@ jobs:
       matrix:
         go: [ "1.25.x", "stable" ]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
@@ -40,6 +40,7 @@ jobs:
         uses: golang/govulncheck-action@v1
         with:
           go-version-input: ${{ matrix.go }}
+          repo-checkout: false
           go-package: ./...
         continue-on-error: true  # 报错时允许工作流继续执行，因为项目依赖的底层包也会有错，很难做到百分百没问题，只打印检测结果就行
 
@@ -47,7 +48,7 @@ jobs:
         run: make test COVERAGE_DIR=/tmp/coverage
 
       - name: Upload test results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: test-results-${{ matrix.go }}
@@ -82,7 +83,7 @@ jobs:
       security-events: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
@@ -105,13 +106,13 @@ jobs:
     steps:
       # 1. 检出代码
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0  # 获取完整历史用于生成更好的 release notes
 
       # 2. 创建 Release 和上传源码包
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
         env:

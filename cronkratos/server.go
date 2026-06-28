@@ -68,9 +68,9 @@ package cronkratos
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
-	"github.com/go-kratos/kratos/v2/log"
 	"github.com/robfig/cron/v3"
 	"github.com/yylego/erero"
 )
@@ -85,7 +85,7 @@ type Server struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	mutex       *sync.RWMutex
-	slog        *log.Helper
+	slog        *slog.Logger
 	startupRuns []func() // tasks that run once at Server.Start() // 启动时跑一次的任务
 	recoverable bool     // service-side default panic catch flag // 服务级默认 recover 开关
 	stage       *Stage   // shared lock-stage aid injected into each AddFunc cmd // 注入到每个 task 的锁阶段辅助
@@ -94,14 +94,14 @@ type Server struct {
 // NewServer constructs a Server wrapping the supplied cron instance.
 // Caller creates the cron instance with the cron options it needs
 // (cron.WithSeconds / cron.WithLocation / cron.WithChain / cron.WithParser)
-// before passing it in. The kratos log.Logger is adapted to cron.Logger
-// in here - business side does not see the adaptation.
+// before passing it in. The supplied *slog.Logger backs the Server lifecycle
+// logs (start, stop, panic catch); Kratos v3 hands such a logger via log.NewLogger.
 //
 // NewServer 构造 Server,封装传入的 cron 实例
 // 业务侧自己 cron.New(...)(用 cron.WithSeconds / cron.WithLocation / cron.WithChain
 // / cron.WithParser 等任何 cron 选项),再传进来
-// kratos log.Logger 适配到 cron.Logger 在内部完成,业务侧看不到适配过程
-func NewServer(c *cron.Cron, slog log.Logger, opts ...ServerOption) *Server {
+// 传入的 *slog.Logger 承载 Server 生命周期日志(启动、停止、panic 兜底);Kratos v3 通过 log.NewLogger 给出这种 logger
+func NewServer(c *cron.Cron, slog *slog.Logger, opts ...ServerOption) *Server {
 	cfg := &serverConfig{}
 	for _, opt := range opts {
 		opt(cfg)
@@ -114,7 +114,7 @@ func NewServer(c *cron.Cron, slog log.Logger, opts ...ServerOption) *Server {
 		ctx:         ctx,
 		cancel:      cancel,
 		mutex:       mutex,
-		slog:        log.NewHelper(slog),
+		slog:        slog,
 		startupRuns: nil,
 		recoverable: cfg.recoverable,
 		stage:       NewStage(mutex.RLocker()),
@@ -189,7 +189,7 @@ func (s *Server) wrapRecoverable(spec string, cmd func()) func() {
 	return func() {
 		defer func() {
 			if rec := recover(); rec != nil {
-				s.slog.Errorw("msg", "cron task panic", "spec", spec, "reason", rec)
+				s.slog.Error("cron task panic", "spec", spec, "reason", rec)
 			}
 		}()
 		cmd()
@@ -218,7 +218,7 @@ func (s *Server) Start(_ context.Context) error {
 	}
 
 	if n := len(s.startupRuns); n > 0 {
-		s.slog.Infof("cron triggered %d startup task(s)", n)
+		s.slog.Info("cron triggered startup tasks", "count", n)
 	}
 	return nil
 }

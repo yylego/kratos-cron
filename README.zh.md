@@ -42,10 +42,12 @@ package main
 
 import (
 	"context"
+	"log/slog"
+	"os"
 	"time"
 
-	"github.com/go-kratos/kratos/v2"
-	"github.com/go-kratos/kratos/v2/log"
+	"github.com/go-kratos/kratos/v3"
+	"github.com/go-kratos/kratos/v3/log"
 	"github.com/robfig/cron/v3"
 	"github.com/yylego/kratos-cron/cronkratos"
 	"github.com/yylego/must"
@@ -58,8 +60,8 @@ func main() {
 		cron.WithLocation(time.FixedZone("CST", 8*60*60)),
 	)
 
-	slog := log.DefaultLogger
-	srv := cronkratos.NewServer(c, slog, cronkratos.WithRecover())
+	applog := log.NewLogger(slog.NewTextHandler(os.Stdout, nil))
+	srv := cronkratos.NewServer(c, applog, cronkratos.WithRecover())
 
 	rese.C1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
 		stage.Do(ctx, func(ctx context.Context) {

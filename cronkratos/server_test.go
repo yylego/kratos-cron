@@ -2,12 +2,12 @@ package cronkratos_test
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/go-kratos/kratos/v2/log"
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/require"
 	"github.com/yylego/kratos-cron/cronkratos"
@@ -19,7 +19,7 @@ import (
 //
 // TestBasicTwoTasks 跑最常见场景:两个 cron 任务并存,一个带 DoOnStartup 一个不带,验证都按预期触发
 func TestBasicTwoTasks(t *testing.T) {
-	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), log.DefaultLogger,
+	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default(),
 		cronkratos.WithRecover(),
 	)
 
@@ -46,7 +46,7 @@ func TestBasicTwoTasks(t *testing.T) {
 //
 // TestStageCoordinatesShutdown 验证三步优雅关停 — Stage.Do 持读锁,Stop 等 fn 返回才 cancel ctx
 func TestStageCoordinatesShutdown(t *testing.T) {
-	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), log.DefaultLogger)
+	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default())
 
 	taskRunning := make(chan struct{})
 	var taskOnce sync.Once
@@ -76,7 +76,7 @@ func TestStageCoordinatesShutdown(t *testing.T) {
 // TestStopProceedsAfterCtxTimeout 边界场景:Stop 的 ctx 中途超时,Stop 仍继续走完拿写锁 + cancel
 // (Stop 并不会因 timeout 提前返回,mutex.Lock 必然等业务读锁释放)
 func TestStopProceedsAfterCtxTimeout(t *testing.T) {
-	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), log.DefaultLogger)
+	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default())
 
 	taskRunning := make(chan struct{})
 	var taskOnce sync.Once
@@ -105,7 +105,7 @@ func TestStopProceedsAfterCtxTimeout(t *testing.T) {
 // TestStageNestedDoNoDeadlock 验证 ctx 标记防嵌套机制:同一调用链上嵌套 Stage.Do 跳过重复加锁,
 // 不会跟并发写锁撞死
 func TestStageNestedDoNoDeadlock(t *testing.T) {
-	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), log.DefaultLogger)
+	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default())
 
 	var innerRan int32
 	rese.C1(srv.AddFunc("* * * * * *", func(ctx context.Context, stage *cronkratos.Stage) {
@@ -128,7 +128,7 @@ func TestStageNestedDoNoDeadlock(t *testing.T) {
 //
 // TestServerLevelWithRecover 验证 WithRecover() 兜住所有 task 的 panic,进程不崩,调度照常
 func TestServerLevelWithRecover(t *testing.T) {
-	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), log.DefaultLogger,
+	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default(),
 		cronkratos.WithRecover(),
 	)
 
