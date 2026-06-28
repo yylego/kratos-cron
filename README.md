@@ -42,8 +42,6 @@ package main
 
 import (
 	"context"
-	"log/slog"
-	"os"
 	"time"
 
 	"github.com/go-kratos/kratos/v3"
@@ -60,7 +58,7 @@ func main() {
 		cron.WithLocation(time.FixedZone("CST", 8*60*60)),
 	)
 
-	applog := log.NewLogger(slog.NewTextHandler(os.Stdout, nil))
+	applog := log.NewLogger(log.NewHandler())
 	srv := cronkratos.NewServer(c, applog, cronkratos.WithRecover())
 
 	rese.C1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
