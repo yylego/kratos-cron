@@ -9,6 +9,25 @@ import (
 	"github.com/yylego/kratos-cron/cronkratos"
 )
 
+type countLock struct{ held int }
+
+func (m *countLock) Lock()   { m.held++ }
+func (m *countLock) Unlock() { m.held-- }
+
+func TestDistinctStagesAcquireOwnLocks(t *testing.T) {
+	a, b := &countLock{}, &countLock{}
+	first, second := cronkratos.NewStage(a), cronkratos.NewStage(b)
+	first.Do(context.Background(), func(ctx context.Context) {
+		second.Do(ctx, func(ctx context.Context) {
+			require.Equal(t, 1, a.held)
+			require.Equal(t, 1, b.held)
+			first.Do(ctx, func(context.Context) { require.Equal(t, 1, a.held) })
+		})
+	})
+	require.Zero(t, a.held)
+	require.Zero(t, b.held)
+}
+
 // TestNonStage_DoesNotBlock verifies NonStage's Do runs fn inline without
 // blocking — noopMutex.Lock/Unlock are no-ops
 //

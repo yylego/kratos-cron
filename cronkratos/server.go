@@ -3,12 +3,12 @@
 // Wraps cron as a Kratos transport.Server with first-class support of:
 //   - clean shutdown coordinated via an in-process RWMutex (Stop waits running
 //     tasks to complete before invalidating ctx)
-//   - panic catch built in (cron.Recover JobWrapper, on as default)
+//   - opt-in panic catch via Recoverable() / WithRecover()
 //   - one-shot startup execution declared at task scope via AddFunc(..., DoOnStartup())
 //   - read-lock aid that lets business tasks coordinate with shutdown
 //
-// Business side does not touch cron.Logger adaptation, cron.WithChain wiring /
-// cron.Recover - each is encapsulated. Users see just Server methods.
+// Task panic logs use the supplied slog instance. The underlying cron instance
+// keeps its own logging and chain configuration.
 //
 // Sample pattern:
 //
@@ -39,11 +39,11 @@
 //
 // 包成 Kratos transport.Server,一站式提供:
 //   - 优雅退出(读写锁机制:Stop 等运行中任务完成才 cancel ctx)
-//   - panic 兜底内建(cron.Recover JobWrapper,默认启用)
+//   - panic 兜底通过 Recoverable() / WithRecover() 显式启用
 //   - 启动跑一次:在 AddFunc 时通过 DoOnStartup() 选项声明,task 粒度配置
 //   - 读锁配合 — 业务任务持读锁可跟 Stop 协调
 //
-// 业务侧不用碰 cron.Logger 适配 / cron.WithChain / cron.Recover - 都封装在内部
+// 任务异常日志使用传入的 slog；底层 cron 的日志和执行链仍由调用方配置。
 //
 // 典型用法:
 //
@@ -69,7 +69,10 @@ package cronkratos
 import (
 	"context"
 	"log/slog"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/robfig/cron/v3"
 	"github.com/yylego/erero"
@@ -80,6 +83,9 @@ import (
 //
 // Server 是 Kratos transport.Server,封装 cron 调度器
 // 用 NewServer 构造,不要零值初始化
+// Register tasks before Start. Use one Start/Stop cycle per instance;
+// lifecycle calls and registration must not run concurrently.
+// 启动前完成任务注册；每个实例使用一次 Start/Stop 生命周期，注册和生命周期方法不并发调用。
 type Server struct {
 	cron        *cron.Cron
 	ctx         context.Context
@@ -126,6 +132,8 @@ func NewServer(c *cron.Cron, slog *slog.Logger, opts ...ServerOption) *Server {
 // Settings controlled via options (each opt-in, no implicit defaults):
 //   - Recoverable() wraps this task with deferred recover (panic -> log + survive)
 //   - DoOnStartup() also runs the task once at Server.Start()
+//   - WithName(name) includes a business name in panic and skip logs
+//   - SkipIfRunning() skips a new run while this registration is active
 //
 // Note: NewServer's WithRecover() is service-side and applies panic catch to
 // each task added through this method, even when a task does not
@@ -139,6 +147,8 @@ func NewServer(c *cron.Cron, slog *slog.Logger, opts ...ServerOption) *Server {
 // 选项控制行为(全部 opt-in,没有隐式默认):
 //   - Recoverable() 给这个 task 包 defer recover(panic -> 打日志 + 不崩进程)
 //   - DoOnStartup() 让 Server.Start() 时也跑一次
+//   - WithName(name) 在异常与跳过日志中包含业务名称
+//   - SkipIfRunning() 在本注册项仍运行时跳过新一次触发
 //
 // 注:NewServer 的 WithRecover() 是服务级配置,作用于通过本方法注册的所有 task,
 // 不论 task 是否单独声明 Recoverable()
@@ -162,7 +172,10 @@ func (s *Server) AddFunc(spec string, cmd func(ctx context.Context, stage *Stage
 	// 同一个 runFunc 同时用于 cron 调度和启动时跑一次
 	runFunc := func() { cmd(s.ctx, s.stage) }
 	if s.recoverable || cfg.recoverable {
-		runFunc = s.wrapRecoverable(spec, runFunc)
+		runFunc = s.wrapRecoverable(spec, cfg.name, runFunc)
+	}
+	if cfg.skipRunning {
+		runFunc = s.wrapSkipRunning(spec, cfg.name, runFunc)
 	}
 
 	num, err := s.cron.AddFunc(spec, runFunc)
@@ -185,13 +198,31 @@ func (s *Server) AddFunc(spec string, cmd func(ctx context.Context, stage *Stage
 // wrapRecoverable 给 cmd 包一层 defer recover,通过 Server.slog 打 panic 日志
 // AddFunc 在 task 是 Recoverable() 或 Server 有 WithRecover() 时调用
 // 包装后的函数同时用于 cron 调度跟 DoOnStartup,两条路径 panic 兜底语义一致
-func (s *Server) wrapRecoverable(spec string, cmd func()) func() {
+func (s *Server) wrapRecoverable(spec, name string, cmd func()) func() {
 	return func() {
 		defer func() {
 			if rec := recover(); rec != nil {
-				s.slog.Error("cron task panic", "spec", spec, "reason", rec)
+				s.slog.Error("cron task panic", "spec", spec, "name", name, "reason", rec, "stack", string(debug.Stack()))
 			}
 		}()
+		cmd()
+	}
+}
+
+func (s *Server) wrapSkipRunning(spec, name string, cmd func()) func() {
+	var active atomic.Pointer[time.Time]
+	return func() {
+		started := time.Now()
+		for {
+			if since := active.Load(); since != nil {
+				s.slog.Info("cron task skipped", "spec", spec, "name", name, "elapsed", time.Since(*since))
+				return
+			}
+			if active.CompareAndSwap(nil, &started) {
+				break
+			}
+		}
+		defer active.Store(nil)
 		cmd()
 	}
 }
@@ -229,8 +260,9 @@ func (s *Server) Start(_ context.Context) error {
 //  2. mutex.Lock()   - acquire write lock, waits on read locks (held in business tasks) to release
 //  3. cancel()       - invalidate srv.ctx
 //
-// The sequence guarantees that a ctx checked inside a business read-lock stays
-// valid throughout that task's run.
+// The write lock prevents shutdown cancellation inside active Stage.Do calls.
+// Startup runs outside Stage.Do are not awaited by cron.Stop.
+// A stop timeout does not interrupt the subsequent lock wait.
 //
 // Stop 实现 Kratos transport.Server 的三步优雅退出:
 //
@@ -238,7 +270,9 @@ func (s *Server) Start(_ context.Context) error {
 //  2. mutex.Lock()   - 拿写锁,等业务任务持有的读锁释放
 //  3. cancel()       - 取消 srv.ctx
 //
-// 顺序保证业务读锁内检查到的 ctx 在业务返回前一定有效
+// 写锁阻止关停流程在正在执行的 Stage.Do 内取消上下文。
+// cron.Stop 不等待启动任务中未受 Stage.Do 保护的代码。
+// 停止上下文超时不能中断后续等锁。
 func (s *Server) Stop(ctx context.Context) error {
 	s.slog.Info("cron stopping")
 

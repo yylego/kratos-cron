@@ -1,13 +1,15 @@
+<!-- TEMPLATE (ZH) BEGIN: BADGES -->
 [![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/yylego/kratos-cron/release.yml?branch=main&label=BUILD)](https://github.com/yylego/kratos-cron/actions/workflows/release.yml?query=branch%3Amain)
 [![GoDoc](https://pkg.go.dev/badge/github.com/yylego/kratos-cron)](https://pkg.go.dev/github.com/yylego/kratos-cron)
 [![Coverage Status](https://img.shields.io/coveralls/github/yylego/kratos-cron/main.svg)](https://coveralls.io/github/yylego/kratos-cron?branch=main)
-[![Supported Go Versions](https://img.shields.io/badge/Go-1.25+-lightgrey.svg)](https://go.dev/)
+[![Supported Go Versions](https://img.shields.io/badge/Go-1.25%2B-lightgrey.svg)](https://go.dev/)
 [![GitHub Release](https://img.shields.io/github/release/yylego/kratos-cron.svg)](https://github.com/yylego/kratos-cron/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yylego/kratos-cron)](https://goreportcard.com/report/github.com/yylego/kratos-cron)
+<!-- TEMPLATE (ZH) CLOSE: BADGES -->
 
 # kratos-cron
 
-把 `robfig/cron` 跟 Kratos 框架集成,封装成 Kratos `transport.Server`。内建 panic 兜底、启动跑一次、读锁配合的优雅退出。
+把 `robfig/cron` 跟 Kratos 框架集成,封装成 Kratos `transport.Server`。提供可选的 panic 兜底、启动跑一次、读锁保护的退出关键段。
 
 ---
 
@@ -17,17 +19,17 @@
 
 [ENGLISH README](README.md)
 
-<!-- TEMPLATE (ZH) END: LANGUAGE NAVIGATION -->
+<!-- TEMPLATE (ZH) CLOSE: LANGUAGE NAVIGATION -->
 
 ## 核心特性
 
-🕐 **Kratos transport.Server** — 直接塞给 `kratos.New(kratos.Server(...))` 用
-🛡️ **优雅退出** — 三步退出,等所有运行中任务完成才让 ctx 失效
-⚡ **关键段 ctx 安全** — `Stage.Do` 持读锁,任务执行期间 ctx 保证有效
-🚀 **启动跑一次** — 任务粒度的 `DoOnStartup()` 选项,不用单独写启动钩子
-🛟 **panic 兜底可选** — 任务级 `Recoverable()` 或服务级 `WithRecover()`
-🔁 **嵌套 Do 防死锁** — 内层 `stage.Do` 自动识别 ctx 标记跳过重复加锁
-📦 **极简 API** — 4 个方法 (`NewServer` / `AddFunc` / `Start` / `Stop`) + 3 个选项
+- 🕐 **Kratos transport.Server** — 直接塞给 `kratos.New(kratos.Server(...))` 用
+- 🛡️ **退出协调** — 停止调度、等待任务和关键段，再取消 ctx
+- ⚡ **关键段保护** — `Stage.Do` 持读锁，阻止关停流程在关键段内取消上下文
+- 🚀 **启动跑一次** — 任务粒度的 `DoOnStartup()` 选项,不用单独写启动钩子
+- 🛟 **panic 兜底可选** — 任务级 `Recoverable()` 或服务级 `WithRecover()`
+- 🔁 **嵌套 Do 避免互等** — 内层 `stage.Do` 自动识别 ctx 标记跳过重复加锁
+- 📦 **精简 API** — 生命周期方法与按需开启的任务选项
 
 ## 安装
 
@@ -66,7 +68,7 @@ func main() {
 			if ctx.Err() != nil {
 				return
 			}
-			// 业务逻辑 — fn 执行期间 ctx 保证有效
+			// 业务逻辑 — 防止关停流程在关键段内取消上下文
 		})
 	}, cronkratos.DoOnStartup()))
 
@@ -109,6 +111,14 @@ srv := cronkratos.NewServer(c, slog, cronkratos.WithRecover())
 
 两层用 **OR** 组合:任一开启就包 defer recover。两层都没配置的任务裸跑,panic 按 goroutine 默认行为传播。
 
+`WithName("行情同步")` 为异常和跳过日志添加业务名称，捕获的 panic 同时记录堆栈。
+两项默认均不开启。被跳过的执行不排队、不补跑。HTTP 接口直接调用业务函数时不经过门控，需要统一互斥时应放在业务共同入口。任务一直不返回时会一直占用门控；本选项不负责超时或取消任务。
+`SkipIfRunning()` 跳过同一注册项在当前进程中的重叠执行，也覆盖 `DoOnStartup()`。跳过时记录已运行时长，任务返回或 panic 时释放门控，不取消正在运行的任务。同名的不同注册项相互独立，不提供分布式锁；任务另起 goroutine 时，必须在任务函数中等待它结束，门控才会覆盖这部分工作。
+
+```go
+rese.C1(srv.AddFunc(spec, fn, cronkratos.WithName("行情同步"), cronkratos.SkipIfRunning(), cronkratos.Recoverable()))
+```
+
 ### 4. 优雅退出协调 — `Stage.Do`
 
 关键代码段用 `stage.Do(ctx, fn)` 包起来:
@@ -126,13 +136,15 @@ srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 })
 ```
 
-`stage.Do` 在 fn 执行期间持 Server 的读锁。`Server.Stop()` 时会先拿**写锁**再取消 ctx — 写锁会等所有未完成的 `stage.Do` 全部返回。所以即使 Stop 跟业务任务并发,`stage.Do` 回调内部检查到的 `ctx` 一定是有效的。
+`stage.Do` 在 fn 执行期间持 Server 的读锁。`Server.Stop()` 必须先拿写锁再取消自身上下文，因此会等待正在执行的关键段。进入回调时仍须检查 `ctx.Err()`：上下文可能在进入前已被取消，业务自行派生的上下文也可能独立超时。
 
-上面那种"循环里每次重新加锁"的写法,让 `Stop` 能在迭代间隙拿写锁,长任务自然收尾,不会被打断到一半。
+`Stop` 先等待定时任务返回或停止上下文超时，再获取写锁。任务不能仅依赖这个上下文被取消来结束；停止期限也不能限制后续等锁的时长。
+
+持锁标记区分每个 `Stage`。派生上下文只用于外层调用期间的同步嵌套调用，不要在外层返回后复用，也不要传给独立运行的 goroutine。
 
 ### 5. 嵌套 `stage.Do` 安全
 
-辅助函数可以再调一次 `stage.Do` — 只要 `ctx` 沿调用链传下去,内层 `stage.Do` 会看到 ctx 上的"持锁中"标记,跳过重复加锁,避免 `RWMutex` 跟并发写者撞上的经典重入死锁:
+辅助函数可以再调一次同一实例的 `stage.Do` — 同步调用沿用派生的 `ctx`，内层识别持锁标记并跳过重复加锁，避免与并发写锁相互等待:
 
 ```go
 stage.Do(ctx, func(ctx context.Context) {
@@ -163,7 +175,9 @@ app := kratos.New(
 )
 ```
 
-`Start` 跟 `Stop` 由 Kratos 生命周期驱动。
+`Start` 跟 `Stop` 由 Kratos 生命周期驱动。启动前完成任务注册，每个实例使用一次启动与停止流程；注册和生命周期方法不并发调用。停止后如需重新启动，应创建新实例。
+
+启动任务不在 cron 自身的运行跟踪范围内，关停时只通过锁等待它们正在执行的 `Stage.Do` 关键段。传给 `cron.WithChain` 的包装只作用于定时执行，不覆盖启动执行；本包的任务选项则覆盖两条路径。
 
 ## 设计说明
 
@@ -175,27 +189,27 @@ app := kratos.New(
 2. **`mutex.Lock()`** — 拿写锁,等所有读锁持有者(运行中的 `stage.Do` 回调)释放。
 3. **`cancel()`** — 取消 Server 的 ctx。
 
-因为 (3) 一定在 (2) 之后,而 (2) 等读锁释放,所以任何 `stage.Do` 回调内部检查到的 ctx 一定在回调返回前都有效。没有"ctx 中途失效"这种坑。
+写锁保证关停流程不会在正在执行的关键段内取消上下文；它不会恢复已经取消的上下文，也不能阻止调用方自行设置的期限到期。
 
-### 为什么用 `Stage.Do` 而不是裸的 mutex?
+### `Stage.Do` 的封装职责
 
 两个理由:
 
 - **隐藏锁。** 业务侧根本不碰 `sync.RWMutex` / `RLocker` / 写锁这些概念,API 表面只有 `stage.Do(ctx, fn)`。
-- **解决嵌套重入。** `sync.RWMutex.RLock` 不可重入 — 在并发的 `Lock` 在等的情况下,同一 goroutine 第二次 `RLock` 会死锁(为防写锁饥饿)。`Stage.Do` 在 ctx 上挂私有标记,嵌套调用看到标记就跳过加锁,死锁消失。
+- **解决嵌套重入。** `sync.RWMutex.RLock` 不可重入，并发的 `Lock` 等待时，重复获取读锁会造成相互等待。`Stage.Do` 使用上下文标记识别同一实例的同步嵌套，跳过重复加锁。
 
 ### `cronkratos` 替业务侧封装的事情
 
 | 底层细节                                 | 内部处理                                      |
 | ---------------------------------------- | --------------------------------------------- |
-| `cron.Logger` 接口适配                   | 包在传入的 Kratos `log.Logger` 外             |
+| 任务异常与跳过日志                       | 使用传入的 `*slog.Logger`                    |
 | `cron.WithChain(cron.Recover(...))` 配线 | 替换成 `Recoverable()` / `WithRecover()` 选项 |
 | `defer recover()` 模板代码               | `wrapRecoverable` 在任一开关启用时自动加      |
 | `sync.RWMutex` + `RLocker` 管线          | 封装在 `Stage.Do` 里                          |
 | `context.WithCancel` 生命周期            | `NewServer` 创建,`Stop` 取消                  |
 | 启动跑一次的簿记                         | 由 `DoOnStartup()` 选项驱动                   |
 
-业务侧看到的只有 4 个方法、3 个选项,加上 `Stage` 类型本身。
+底层 cron 仍使用它自己的日志配置，本包不会安装 `cron.Logger` 适配器。
 
 ## 演示
 
@@ -233,8 +247,8 @@ MIT 许可证 - 详见 [LICENSE](LICENSE)。
 新代码贡献，请遵循此流程：
 
 1. **Fork**：在 GitHub 上 Fork 仓库（使用网页界面）
-2. **克隆**：克隆 Fork 的项目（`git clone https://github.com/yourname/kratos-cron.git`）
-3. **导航**：进入克隆的项目（`cd kratos-cron`）
+2. **克隆**：克隆 Fork 的项目（`git clone https://github.com/yourname/repo-name.git`）
+3. **导航**：进入克隆的项目（`cd repo-name`）
 4. **分支**：创建功能分支（`git checkout -b feature/xxx`）
 5. **编码**：实现您的更改并编写全面的测试
 6. **测试**：（Golang 项目）确保测试通过（`go test ./...`）并遵循 Go 代码风格约定
@@ -261,10 +275,12 @@ MIT 许可证 - 详见 [LICENSE](LICENSE)。
 
 **祝你用这个包编程愉快！** 🎉🎉🎉
 
-<!-- TEMPLATE (ZH) END: STANDARD PROJECT FOOTER -->
+<!-- TEMPLATE (ZH) CLOSE: STANDARD PROJECT FOOTER -->
 
 ---
 
+<!-- TEMPLATE (ZH) BEGIN: GITHUB STARS -->
 ## GitHub 标星点赞
 
-[![标星点赞](https://starchart.cc/yylego/kratos-cron.svg?variant=adaptive)](https://starchart.cc/yylego/kratos-cron)
+[![Stargazers](https://starchart.cc/yylego/kratos-cron.svg?variant=adaptive)](https://starchart.cc/yylego/kratos-cron)
+<!-- TEMPLATE (ZH) CLOSE: GITHUB STARS -->

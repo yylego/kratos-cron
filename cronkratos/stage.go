@@ -21,6 +21,8 @@ type Stage struct {
 //
 // NewStage 用给定的 sync.Locker 构造 Stage
 // Server 内部用 NewStage(mutex.RLocker()); 手动触发等不参与协调的路径请用 NonStage
+// Reuse the same Stage for nested calls sharing a lock; do not copy it.
+// 同一把锁的嵌套调用应复用同一个 Stage，不复制或另建包装。
 func NewStage(rmu sync.Locker) *Stage {
 	return &Stage{rmu: rmu}
 }
@@ -48,21 +50,24 @@ func (*noopMutex) Unlock() {}
 // avoid the classic R/W reentrance deadlock with a concurrent Stop.
 //
 // stageHoldingCtxKey 标记 ctx 在当前调用链上已持有 Stage 读锁
-// Do 用它识别嵌套调用,跳过重复加锁,避免跟并发 Stop 撞上经典的 R/W 重入死锁
-type stageHoldingCtxKey struct{}
+// Do 用它识别嵌套调用，跳过重复加锁，避免与并发 Stop 相互等待
+type stageHoldingCtxKey struct{ stage *Stage }
 
 // Do acquires the read-lock when ctx is fresh, runs fn, then releases. When the
-// supplied ctx has the "holding" tag (from an outermost Do on the same
+// supplied ctx has this Stage's "holding" tag (from an active outer Do on the same
 // invocation chain), fn runs inline without re-acquiring the lock - this
 // avoids the nested-RLock deadlock that would otherwise arise with a
 // concurrent Stop. The lock is held just while fn executes; Stop() blocks
-// on the write lock—fn returns, preventing ctx invalidation mid-task -
-// as long as the ctx supplied to Stop does not time out before this fn returns.
+// on the write lock until fn returns, preventing shutdown cancellation mid-task.
+// Check ctx.Err() on entry: ctx may already be cancelled or have its own deadline.
+// Pass the tagged ctx through synchronous nested calls only, not to independent
+// goroutines or calls made after the outer Do returns.
 //
 // Do 检测 ctx 上的"持锁中"标记:首次调用加读锁并把标记注入 ctx 传给 fn;
-// 嵌套调用时 ctx 已有标记,直接执行 fn 不再加锁 — 天然避免嵌套死锁
-// Stop() 拿写锁会阻塞等 fn 返回,确保 ctx 在 task 中途不失效 —
-// 前提是传给 Stop 的 ctx 在 fn 返回前不超时
+// 同一个 Stage 同步嵌套时，ctx 已有对应标记，直接执行 fn 不再加锁。
+// Stop() 拿写锁会等 fn 返回，避免关停流程在关键段中途取消上下文。
+// 进入时仍须检查 ctx.Err()：ctx 可能早已取消，或有独立的超时期限。
+// 带标记的 ctx 只用于外层 Do 尚未返回时的同步嵌套，不传给独立 goroutine，也不在外层返回后复用。
 //
 // Sample pattern (each-iteration locking inside a long-running cron task):
 //
@@ -109,7 +114,7 @@ type stageHoldingCtxKey struct{}
 // 这个机制要解决的问题:sync.RWMutex.RLock 不可重入 — 当并发的 Stop 已经在等
 // Lock() 时, 同一 goroutine 第二次 RLock 会被这个 pending Lock() 顶住
 // (RWMutex 防写锁饥饿的机制). 外层 RLock 等 fn, fn 等内层 RLock,
-// 内层 RLock 等 Lock(), Lock() 等外层 RLock — 死锁闭环
+// 内层 RLock 等 Lock(), Lock() 等外层 RLock — 循环等待
 // ctx 标记让内层 Do 跳过加锁,直接绕开这个陷阱
 //
 // Panic semantics: Stage.Do does NOT deferred-recover panics raised inside
@@ -141,11 +146,12 @@ type stageHoldingCtxKey struct{}
 // Stage 保持专注于锁语义本身. Go 标准库的同步原语 (sync.Mutex / sync.RWMutex)
 // 也都是这个立场 — 不替调用方兜 panic
 func (s *Stage) Do(ctx context.Context, fn func(ctx context.Context)) {
-	if ctx.Value(stageHoldingCtxKey{}) != nil {
+	key := stageHoldingCtxKey{stage: s}
+	if ctx.Value(key) != nil {
 		fn(ctx)
 		return
 	}
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
-	fn(context.WithValue(ctx, stageHoldingCtxKey{}, struct{}{}))
+	fn(context.WithValue(ctx, key, struct{}{}))
 }

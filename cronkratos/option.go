@@ -36,6 +36,26 @@ type TaskOption func(*taskConfig)
 type taskConfig struct {
 	doOnStartup bool
 	recoverable bool
+	name        string
+	skipRunning bool
+}
+
+// WithName sets the business name used in task logs.
+// WithName 设置任务日志中的业务名称，不作为互斥键。
+func WithName(name string) TaskOption {
+	return func(c *taskConfig) { c.name = name }
+}
+
+// SkipIfRunning skips overlapping runs of this registration in this process.
+// Startup and scheduled runs share the same gate. Active work continues unchanged.
+// Runs skipped during active work are not queued. Direct calls to the business
+// function bypass this gate. Work started in a goroutine must be awaited by the task.
+// SkipIfRunning 跳过同一注册项在当前进程内的重叠执行。
+// 启动执行和定时执行共用门控，不取消正在运行的任务，也不跨进程互斥。
+// 被跳过的执行不排队补跑；直接调用业务函数不经过门控。
+// 任务另起 goroutine 时，须等待其结束；不设置本选项时允许重叠执行。
+func SkipIfRunning() TaskOption {
+	return func(c *taskConfig) { c.skipRunning = true }
 }
 
 // DoOnStartup also runs the task once when Server.Start() is invoked,

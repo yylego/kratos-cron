@@ -103,7 +103,7 @@ func TestStopProceedsAfterCtxTimeout(t *testing.T) {
 // against a concurrent Lock() pending on RWMutex
 //
 // TestStageNestedDoNoDeadlock 验证 ctx 标记防嵌套机制:同一调用链上嵌套 Stage.Do 跳过重复加锁,
-// 不会跟并发写锁撞死
+// 避免与并发写锁相互等待
 func TestStageNestedDoNoDeadlock(t *testing.T) {
 	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default())
 

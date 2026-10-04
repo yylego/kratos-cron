@@ -1,13 +1,15 @@
+<!-- TEMPLATE (EN) BEGIN: BADGES -->
 [![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/yylego/kratos-cron/release.yml?branch=main&label=BUILD)](https://github.com/yylego/kratos-cron/actions/workflows/release.yml?query=branch%3Amain)
 [![GoDoc](https://pkg.go.dev/badge/github.com/yylego/kratos-cron)](https://pkg.go.dev/github.com/yylego/kratos-cron)
 [![Coverage Status](https://img.shields.io/coveralls/github/yylego/kratos-cron/main.svg)](https://coveralls.io/github/yylego/kratos-cron?branch=main)
-[![Supported Go Versions](https://img.shields.io/badge/Go-1.25+-lightgrey.svg)](https://go.dev/)
+[![Supported Go Versions](https://img.shields.io/badge/Go-1.25%2B-lightgrey.svg)](https://go.dev/)
 [![GitHub Release](https://img.shields.io/github/release/yylego/kratos-cron.svg)](https://github.com/yylego/kratos-cron/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yylego/kratos-cron)](https://goreportcard.com/report/github.com/yylego/kratos-cron)
+<!-- TEMPLATE (EN) CLOSE: BADGES -->
 
 # kratos-cron
 
-Cron task integration with the Kratos framework. Wraps `robfig/cron` as a Kratos `transport.Server` with built-in panic catch, startup execution, plus read-lock protected clean shutdown.
+Cron task integration with the Kratos framework. Wraps `robfig/cron` as a Kratos `transport.Server` with opt-in panic catch, startup execution, plus read-lock protected shutdown sections.
 
 ---
 
@@ -17,17 +19,17 @@ Cron task integration with the Kratos framework. Wraps `robfig/cron` as a Kratos
 
 [中文说明](README.zh.md)
 
-<!-- TEMPLATE (EN) END: LANGUAGE NAVIGATION -->
+<!-- TEMPLATE (EN) CLOSE: LANGUAGE NAVIGATION -->
 
 ## Main Features
 
-🕐 **Kratos transport.Server** — Plug a cron schedule inline into `kratos.New(kratos.Server(...))`
-🛡️ **Clean shutdown** — Three-step shutdown waits on running tasks before invalidating ctx
-⚡ **Context-safe hot sections** — `Stage.Do` holds a read-lock so ctx stays valid mid-task
-🚀 **Run-once-at-startup** — Task-scope `DoOnStartup()` option, no separate boot hook needed
-🛟 **Opt-in panic catch** — Task-scope `Recoverable()` / service-side `WithRecover()`
-🔁 **Nested-Do deadlock-safe** — Nested `stage.Do` calls auto-detect the holding ctx and skip re-locking
-📦 **Compact surface** — 4 methods (`NewServer` / `AddFunc` / `Start` / `Stop`) + 3 options
+- 🕐 **Kratos transport.Server** — Plug a cron schedule inline into `kratos.New(kratos.Server(...))`
+- 🛡️ **Shutdown coordination** — Stops scheduling, waits on tasks and protected sections, then cancels ctx
+- ⚡ **Protected sections** — `Stage.Do` holds a read-lock against shutdown cancellation
+- 🚀 **Run-once-at-startup** — Task-scope `DoOnStartup()` option, no separate boot hook needed
+- 🛟 **Opt-in panic catch** — Task-scope `Recoverable()` / service-side `WithRecover()`
+- 🔁 **Nested-Do deadlock-safe** — Nested `stage.Do` calls auto-detect the holding ctx and skip re-locking
+- 📦 **Compact surface** — Lifecycle methods plus opt-in task settings
 
 ## Installation
 
@@ -66,7 +68,7 @@ func main() {
 			if ctx.Err() != nil {
 				return
 			}
-			// business logic — ctx stays valid as long as fn runs
+			// business logic — protected against shutdown cancellation
 		})
 	}, cronkratos.DoOnStartup()))
 
@@ -109,6 +111,14 @@ srv := cronkratos.NewServer(c, slog, cronkratos.WithRecover())
 
 The two compose with **OR** semantics: one flag is enough. A task with no flag set runs raw — panics propagate as standard.
 
+`WithName("sync-quotes")` adds a business name to panic and skip logs. Caught panics include a stack trace.
+Both options are off by default. Skipped runs are not queued or replayed. Direct calls from an HTTP endpoint to the business function bypass this gate; put shared exclusion in the business entry point when needed. A task that never returns keeps its gate occupied; this option does not impose a timeout or cancel work.
+`SkipIfRunning()` skips overlapping runs of the same registration within one process, including `DoOnStartup()` runs. It logs the elapsed time of active work and releases the gate on return / panic. Active work continues unchanged. Separate registrations remain independent even with matching names; this is not a distributed lock. Work launched in a separate goroutine must be awaited inside the task to remain within the gate.
+
+```go
+rese.C1(srv.AddFunc(spec, fn, cronkratos.WithName("sync-quotes"), cronkratos.SkipIfRunning(), cronkratos.Recoverable()))
+```
+
 ### 4. Clean shutdown coordination — `Stage.Do`
 
 Wrap hot sections with `stage.Do(ctx, fn)`:
@@ -126,9 +136,11 @@ srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 })
 ```
 
-`stage.Do` acquires the Server's read-lock during `fn`. When `Server.Stop()` runs, it acquires the **write lock** before cancelling ctx — so the write-lock acquisition waits on each in-flight `stage.Do` to return. This guarantees `ctx` stays valid _inside_ the `stage.Do` callback even when Stop is racing.
+`stage.Do` acquires the Server's read-lock during `fn`. `Server.Stop()` must acquire the write lock before cancelling its context, so it waits for active protected sections. Check `ctx.Err()` on entry: shutdown may have already cancelled it before entry, and an independently derived context may expire on its own.
 
-The lock-each-iteration pattern (above) lets `Stop` slip in between iterations, so a long-running task drains in chunks instead of being killed mid-step.
+`Stop` first waits for scheduled tasks to return or its context to expire, then takes the write lock. A task must not rely solely on this context being cancelled to finish. The stop deadline does not bound the subsequent lock wait.
+
+Holding tags distinguish each `Stage`. Pass the derived context only through synchronous nested calls while the outer call is active; do not reuse it after that call returns or pass it to independent goroutines.
 
 ### 5. Nested `stage.Do` is safe
 
@@ -163,7 +175,9 @@ app := kratos.New(
 )
 ```
 
-`Start` and `Stop` are driven via the Kratos lifecycle.
+`Start` and `Stop` are driven via the Kratos lifecycle. Register tasks before starting. Use one start/stop cycle per instance; registration and lifecycle calls must not run concurrently. Create a new instance to start again after stopping.
+
+Startup tasks run outside cron's own tracking. Only their active `Stage.Do` sections participate in the lock wait during shutdown. Options passed to `cron.WithChain` apply to scheduled runs, not startup runs; this package's task options apply to both.
 
 ## Design
 
@@ -175,7 +189,7 @@ app := kratos.New(
 2. **`mutex.Lock()`** — acquires the write lock, waiting on each holding goroutine (active `stage.Do` callbacks) to release.
 3. **`cancel()`** — invalidates the Server's ctx.
 
-Because (3) just fires past (2), and (2) waits on read-lock holders, the ctx checked inside each `stage.Do` callback is guaranteed valid throughout that callback's run. No "ctx cancelled mid-step" surprises.
+The write lock prevents shutdown cancellation during an active protected section. It does not revive a context already cancelled or prevent a deadline set by the caller.
 
 ### Stage.Do — picked instead of a raw mutex
 
@@ -188,14 +202,14 @@ Two reasons:
 
 | Underlying concern                         | Handled in here                                        |
 | ------------------------------------------ | ------------------------------------------------------ |
-| `cron.Logger` adaptation                   | Wrapped around the Kratos `log.Logger` you pass in     |
+| Task panic and skip logs                   | Written through the supplied `*slog.Logger`           |
 | `cron.WithChain(cron.Recover(...))` wiring | Replaced via `Recoverable()` / `WithRecover()` options |
 | `defer recover()` boilerplate              | Done via `wrapRecoverable` when one flag is set        |
 | `sync.RWMutex` + `RLocker` plumbing        | Encapsulated in `Stage.Do`                             |
 | `context.WithCancel` lifetime              | Created in `NewServer`, cancelled in `Stop`            |
 | Run-once-at-boot bookkeeping               | Driven via `DoOnStartup()` option                      |
 
-The business side sees 4 methods, 3 options, plus the `Stage` type.
+The underlying cron instance retains its own logging configuration; this package does not install a `cron.Logger` adapter.
 
 ## Demo
 
@@ -233,8 +247,8 @@ Contributions are welcome! Report bugs, suggest features, and contribute code:
 New code contributions, follow this process:
 
 1. **Fork**: Fork the repo on GitHub (using the webpage UI).
-2. **Clone**: Clone the forked project (`git clone https://github.com/yourname/kratos-cron.git`).
-3. **Navigate**: Navigate to the cloned project (`cd kratos-cron`)
+2. **Clone**: Clone the forked project (`git clone https://github.com/yourname/repo-name.git`).
+3. **Navigate**: Navigate to the cloned project (`cd repo-name`)
 4. **Branch**: Create a feature branch (`git checkout -b feature/xxx`).
 5. **Code**: Implement the changes with comprehensive tests
 6. **Testing**: (Golang project) Ensure tests pass (`go test ./...`) and follow Go code style conventions
@@ -261,10 +275,12 @@ Welcome to contribute to this project via submitting merge requests and reportin
 
 **Have Fun Coding with this package!** 🎉🎉🎉
 
-<!-- TEMPLATE (EN) END: STANDARD PROJECT FOOTER -->
+<!-- TEMPLATE (EN) CLOSE: STANDARD PROJECT FOOTER -->
 
 ---
 
+<!-- TEMPLATE (EN) BEGIN: GITHUB STARS -->
 ## GitHub Stars
 
 [![Stargazers](https://starchart.cc/yylego/kratos-cron.svg?variant=adaptive)](https://starchart.cc/yylego/kratos-cron)
+<!-- TEMPLATE (EN) CLOSE: GITHUB STARS -->
