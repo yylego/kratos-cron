@@ -49,7 +49,7 @@ func WithName(name string) TaskOption {
 // SkipIfRunning skips overlapping runs of this registration in this process.
 // Startup and scheduled runs share the same gate. Active work continues unchanged.
 // Runs skipped during active work are not queued. Direct calls to the business
-// function bypass this gate. Work started in a goroutine must be awaited by the task.
+// function bypass this gate. Tasks must join spawned goroutines.
 // SkipIfRunning 跳过同一注册项在当前进程内的重叠执行。
 // 启动执行和定时执行共用门控，不取消正在运行的任务，也不跨进程互斥。
 // 被跳过的执行不排队补跑；直接调用业务函数不经过门控。

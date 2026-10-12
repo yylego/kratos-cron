@@ -10,6 +10,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/require"
+	"github.com/yylego/erero"
 	"github.com/yylego/kratos-cron/cronkratos"
 	"github.com/yylego/rese"
 )
@@ -41,6 +42,86 @@ func TestBasicTwoTasks(t *testing.T) {
 	require.GreaterOrEqual(t, atomic.LoadInt32(&scheduledCount), int32(2))
 }
 
+func TestStopBeforeFirstRun(t *testing.T) {
+	t.Run("no active task", func(t *testing.T) {
+		srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default())
+		ran := false
+		_, err := srv.AddFunc("@every 24h", func(context.Context, *cronkratos.Stage) { ran = true })
+		require.NoError(t, err)
+		require.NoError(t, srv.Start(context.Background()))
+		require.NoError(t, srv.Stop(context.Background()))
+		require.False(t, ran)
+	})
+}
+
+func TestStopAwaitsStepAndTask(t *testing.T) {
+	for _, startup := range []bool{false, true} {
+		name := "scheduled"
+		if startup {
+			name = "startup"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Run("completion", func(t *testing.T) {
+				srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default())
+				entered := make(chan context.Context, 1)
+				finishStep := make(chan struct{})
+				finishTask := make(chan struct{})
+				cleaned := false
+				ranNext := false
+				opts := []cronkratos.TaskOption{}
+				spec := "@every 1s"
+				if startup {
+					opts = append(opts, cronkratos.DoOnStartup())
+					spec = "@every 24h"
+				}
+				_, err := srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
+					defer func() {
+						<-finishTask
+						cleaned = true
+					}()
+					stage.Do(ctx, func(ctx context.Context) {
+						entered <- ctx
+						<-finishStep
+					})
+					<-ctx.Done()
+					stage.Do(ctx, func(ctx context.Context) {
+						if ctx.Err() != nil {
+							return
+						}
+						ranNext = true
+					})
+				}, opts...)
+				require.NoError(t, err)
+				require.NoError(t, srv.Start(context.Background()))
+				ctx := <-entered
+				stopped := make(chan error, 1)
+				stopCtx, cancel := context.WithCancel(context.Background())
+				cancel()
+				go func() { stopped <- srv.Stop(stopCtx) }()
+				select {
+				case <-stopped:
+					t.Fatal("Stop returned before the active step completed")
+				case <-time.After(20 * time.Millisecond):
+				}
+				require.NoError(t, ctx.Err())
+				require.Empty(t, stopped)
+				close(finishStep)
+				<-ctx.Done()
+				require.ErrorIs(t, ctx.Err(), context.Canceled)
+				select {
+				case <-stopped:
+					t.Fatal("Stop returned before task cleanup completed")
+				case <-time.After(20 * time.Millisecond):
+				}
+				close(finishTask)
+				require.NoError(t, <-stopped)
+				require.True(t, cleaned)
+				require.False(t, ranNext)
+			})
+		})
+	}
+}
+
 // TestStageCoordinatesShutdown verifies the three-step clean shutdown -
 // Stage.Do holds the read-lock so Stop waits—fn returns before cancelling ctx
 //
@@ -56,9 +137,10 @@ func TestStageCoordinatesShutdown(t *testing.T) {
 		stage.Do(ctx, func(ctx context.Context) {
 			taskOnce.Do(func() { close(taskRunning) })
 			time.Sleep(800 * time.Millisecond)
-			if ctx.Err() == nil {
-				atomic.StoreInt32(&ctxValidAtEnd, 1)
+			if ctx.Err() != nil {
+				return
 			}
+			atomic.StoreInt32(&ctxValidAtEnd, 1)
 		})
 	}))
 
@@ -68,14 +150,10 @@ func TestStageCoordinatesShutdown(t *testing.T) {
 	require.Equal(t, int32(1), atomic.LoadInt32(&ctxValidAtEnd))
 }
 
-// TestStopProceedsAfterCtxTimeout covers the edge case where Stop's ctx
-// times out mid-shutdown - Stop continues to acquire the write lock and
-// cancel (Stop ignores the timeout to skip the wait; mutex.Lock waits
-// on the in-flight task to release the read-lock regardless)
+// TestStopAwaitsCompletionDespiteTimeout checks that a stop deadline does not cut short an active step.
 //
-// TestStopProceedsAfterCtxTimeout 边界场景:Stop 的 ctx 中途超时,Stop 仍继续走完拿写锁 + cancel
-// (Stop 并不会因 timeout 提前返回,mutex.Lock 必然等业务读锁释放)
-func TestStopProceedsAfterCtxTimeout(t *testing.T) {
+// TestStopAwaitsCompletionDespiteTimeout 验证停止期限不会中断当前步骤或让 Stop 提前返回。
+func TestStopAwaitsCompletionDespiteTimeout(t *testing.T) {
 	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default())
 
 	taskRunning := make(chan struct{})
@@ -107,11 +185,11 @@ func TestStopProceedsAfterCtxTimeout(t *testing.T) {
 func TestStageNestedDoNoDeadlock(t *testing.T) {
 	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default())
 
-	var innerRan int32
+	var nestedRan int32
 	rese.C1(srv.AddFunc("* * * * * *", func(ctx context.Context, stage *cronkratos.Stage) {
 		stage.Do(ctx, func(ctx context.Context) {
 			stage.Do(ctx, func(_ context.Context) {
-				atomic.StoreInt32(&innerRan, 1)
+				atomic.StoreInt32(&nestedRan, 1)
 			})
 		})
 	}))
@@ -119,15 +197,15 @@ func TestStageNestedDoNoDeadlock(t *testing.T) {
 	require.NoError(t, srv.Start(context.Background()))
 	time.Sleep(1500 * time.Millisecond)
 	require.NoError(t, srv.Stop(context.Background()))
-	require.Equal(t, int32(1), atomic.LoadInt32(&innerRan))
+	require.Equal(t, int32(1), atomic.LoadInt32(&nestedRan))
 }
 
-// TestServerLevelWithRecover verifies WithRecover() catches panics from each
+// TestServerPanicCatch verifies WithRecover() catches panics from each
 // task added via AddFunc, so panicking tasks do not crash the process
 // and the cron schedule keeps firing
 //
-// TestServerLevelWithRecover 验证 WithRecover() 兜住所有 task 的 panic,进程不崩,调度照常
-func TestServerLevelWithRecover(t *testing.T) {
+// TestServerPanicCatch 验证 WithRecover() 兜住所有 task 的 panic,进程不崩,调度照常
+func TestServerPanicCatch(t *testing.T) {
 	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default(),
 		cronkratos.WithRecover(),
 	)
@@ -135,7 +213,7 @@ func TestServerLevelWithRecover(t *testing.T) {
 	var fired int32
 	rese.C1(srv.AddFunc("* * * * * *", func(_ context.Context, _ *cronkratos.Stage) {
 		atomic.AddInt32(&fired, 1)
-		panic("deliberate panic — service-side recover should catch this")
+		panic(erero.New("panic catch test"))
 	}))
 
 	require.NoError(t, srv.Start(context.Background()))

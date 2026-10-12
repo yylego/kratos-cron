@@ -104,9 +104,9 @@ func TestTaskGateStartupAndSchedule(t *testing.T) {
 	require.Contains(t, logs.String(), "sample")
 	// A distinct registration with the same name has its own gate.
 	// 同名的不同注册项各有独立门控。
-	otherID, err := srv.AddFunc("0 0 * * *", func(context.Context, *Stage) { calls.Add(1) }, SkipIfRunning(), WithName("sample"))
+	nextID, err := srv.AddFunc("0 0 * * *", func(context.Context, *Stage) { calls.Add(1) }, SkipIfRunning(), WithName("sample"))
 	require.NoError(t, err)
-	c.Entry(otherID).Job.Run()
+	c.Entry(nextID).Job.Run()
 	require.EqualValues(t, 2, calls.Load())
 	release <- struct{}{}
 	select {

@@ -21,7 +21,7 @@ type Stage struct {
 //
 // NewStage 用给定的 sync.Locker 构造 Stage
 // Server 内部用 NewStage(mutex.RLocker()); 手动触发等不参与协调的路径请用 NonStage
-// Reuse the same Stage for nested calls sharing a lock; do not copy it.
+// Nested invocations sharing a lock must reuse the same Stage instance.
 // 同一把锁的嵌套调用应复用同一个 Stage，不复制或另建包装。
 func NewStage(rmu sync.Locker) *Stage {
 	return &Stage{rmu: rmu}
@@ -45,23 +45,23 @@ type noopMutex struct{}
 func (*noopMutex) Lock()   {}
 func (*noopMutex) Unlock() {}
 
-// stageHoldingCtxKey tags a ctx as having Stage's read-lock on this
+// stageHoldingTag tags a ctx as having Stage's read-lock on this
 // invocation chain. Do uses this tag to short-circuit nested invocations and
 // avoid the classic R/W reentrance deadlock with a concurrent Stop.
 //
-// stageHoldingCtxKey 标记 ctx 在当前调用链上已持有 Stage 读锁
+// stageHoldingTag 标记 ctx 在当前调用链上已持有 Stage 读锁
 // Do 用它识别嵌套调用，跳过重复加锁，避免与并发 Stop 相互等待
-type stageHoldingCtxKey struct{ stage *Stage }
+type stageHoldingTag struct{ stage *Stage }
 
 // Do acquires the read-lock when ctx is fresh, runs fn, then releases. When the
-// supplied ctx has this Stage's "holding" tag (from an active outer Do on the same
+// supplied ctx has this Stage's "holding" tag (from an active enclosing Do on the same
 // invocation chain), fn runs inline without re-acquiring the lock - this
 // avoids the nested-RLock deadlock that would otherwise arise with a
 // concurrent Stop. The lock is held just while fn executes; Stop() blocks
-// on the write lock until fn returns, preventing shutdown cancellation mid-task.
-// Check ctx.Err() on entry: ctx may already be cancelled or have its own deadline.
-// Pass the tagged ctx through synchronous nested calls only, not to independent
-// goroutines or calls made after the outer Do returns.
+// on the write lock while fn executes, preventing shutdown cancellation mid-task.
+// Check ctx.Err() inside fn: cancellation and derived context deadlines remain possible.
+// Pass the tagged ctx through synchronous nested calls while the enclosing Do remains active.
+// Do not retain this ctx beyond that scope; do not pass it to independent goroutines.
 //
 // Do 检测 ctx 上的"持锁中"标记:首次调用加读锁并把标记注入 ctx 传给 fn;
 // 同一个 Stage 同步嵌套时，ctx 已有对应标记，直接执行 fn 不再加锁。
@@ -73,6 +73,7 @@ type stageHoldingCtxKey struct{ stage *Stage }
 //
 //	srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 //	    for _, item := range list {
+//	        if ctx.Err() != nil { return }
 //	        stage.Do(ctx, func(ctx context.Context) {
 //	            if ctx.Err() != nil { return }
 //	            // process item inside the read-lock
@@ -84,6 +85,7 @@ type stageHoldingCtxKey struct{ stage *Stage }
 //
 //	srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 //	    for _, item := range list {
+//	        if ctx.Err() != nil { return }
 //	        stage.Do(ctx, func(ctx context.Context) {
 //	            if ctx.Err() != nil { return }
 //	            // 持读锁内处理 item
@@ -95,13 +97,13 @@ type stageHoldingCtxKey struct{ stage *Stage }
 // the nested Do sees the tag on ctx and skips re-locking:
 //
 //	stage.Do(ctx, func(ctx context.Context) {
-//	    helperCallingDo(ctx, stage)  // nested Do sees the tag, skips re-locking
+//	    processBatch(ctx, stage)  // nested Do sees the tag, skips re-locking
 //	})
 //
 // 嵌套调用安全,前提是 ctx 沿调用链传下去 — 内层 Do 看到标记就跳过加锁:
 //
 //	stage.Do(ctx, func(ctx context.Context) {
-//	    helperCallingDo(ctx, stage)  // 内层 Do 看到标记,跳过重新加锁
+//	    processBatch(ctx, stage)  // 内层 Do 看到标记,跳过重新加锁
 //	})
 //
 // What this prevents: sync.RWMutex.RLock is NOT reentrant — when a concurrent
@@ -146,12 +148,12 @@ type stageHoldingCtxKey struct{ stage *Stage }
 // Stage 保持专注于锁语义本身. Go 标准库的同步原语 (sync.Mutex / sync.RWMutex)
 // 也都是这个立场 — 不替调用方兜 panic
 func (s *Stage) Do(ctx context.Context, fn func(ctx context.Context)) {
-	key := stageHoldingCtxKey{stage: s}
-	if ctx.Value(key) != nil {
+	tag := stageHoldingTag{stage: s}
+	if ctx.Value(tag) != nil {
 		fn(ctx)
 		return
 	}
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
-	fn(context.WithValue(ctx, key, struct{}{}))
+	fn(context.WithValue(ctx, tag, struct{}{}))
 }

@@ -1,4 +1,5 @@
 <!-- TEMPLATE (ZH) BEGIN: BADGES -->
+
 [![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/yylego/kratos-cron/release.yml?branch=main&label=BUILD)](https://github.com/yylego/kratos-cron/actions/workflows/release.yml?query=branch%3Amain)
 [![GoDoc](https://pkg.go.dev/badge/github.com/yylego/kratos-cron)](https://pkg.go.dev/github.com/yylego/kratos-cron)
 [![Coverage Status](https://img.shields.io/coveralls/github/yylego/kratos-cron/main.svg)](https://coveralls.io/github/yylego/kratos-cron?branch=main)
@@ -24,7 +25,7 @@
 ## 核心特性
 
 - 🕐 **Kratos transport.Server** — 直接塞给 `kratos.New(kratos.Server(...))` 用
-- 🛡️ **退出协调** — 停止调度、等待任务和关键段，再取消 ctx
+- 🛡️ **退出协调** — 停止调度、等当前关键段完成、取消 ctx，再等任务返回
 - ⚡ **关键段保护** — `Stage.Do` 持读锁，阻止关停流程在关键段内取消上下文
 - 🚀 **启动跑一次** — 任务粒度的 `DoOnStartup()` 选项,不用单独写启动钩子
 - 🛟 **panic 兜底可选** — 任务级 `Recoverable()` 或服务级 `WithRecover()`
@@ -111,12 +112,12 @@ srv := cronkratos.NewServer(c, slog, cronkratos.WithRecover())
 
 两层用 **OR** 组合:任一开启就包 defer recover。两层都没配置的任务裸跑,panic 按 goroutine 默认行为传播。
 
-`WithName("行情同步")` 为异常和跳过日志添加业务名称，捕获的 panic 同时记录堆栈。
+`WithName("数据同步")` 为异常和跳过日志添加业务名称，捕获的 panic 同时记录堆栈。
 两项默认均不开启。被跳过的执行不排队、不补跑。HTTP 接口直接调用业务函数时不经过门控，需要统一互斥时应放在业务共同入口。任务一直不返回时会一直占用门控；本选项不负责超时或取消任务。
 `SkipIfRunning()` 跳过同一注册项在当前进程中的重叠执行，也覆盖 `DoOnStartup()`。跳过时记录已运行时长，任务返回或 panic 时释放门控，不取消正在运行的任务。同名的不同注册项相互独立，不提供分布式锁；任务另起 goroutine 时，必须在任务函数中等待它结束，门控才会覆盖这部分工作。
 
 ```go
-rese.C1(srv.AddFunc(spec, fn, cronkratos.WithName("行情同步"), cronkratos.SkipIfRunning(), cronkratos.Recoverable()))
+rese.C1(srv.AddFunc(spec, fn, cronkratos.WithName("数据同步"), cronkratos.SkipIfRunning(), cronkratos.Recoverable()))
 ```
 
 ### 4. 优雅退出协调 — `Stage.Do`
@@ -126,6 +127,9 @@ rese.C1(srv.AddFunc(spec, fn, cronkratos.WithName("行情同步"), cronkratos.Sk
 ```go
 srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
     for _, item := range list {
+        if ctx.Err() != nil {
+            return
+        }
         stage.Do(ctx, func(ctx context.Context) {
             if ctx.Err() != nil {
                 return
@@ -138,7 +142,7 @@ srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 
 `stage.Do` 在 fn 执行期间持 Server 的读锁。`Server.Stop()` 必须先拿写锁再取消自身上下文，因此会等待正在执行的关键段。进入回调时仍须检查 `ctx.Err()`：上下文可能在进入前已被取消，业务自行派生的上下文也可能独立超时。
 
-`Stop` 先等待定时任务返回或停止上下文超时，再获取写锁。任务不能仅依赖这个上下文被取消来结束；停止期限也不能限制后续等锁的时长。
+`Stop` 先等当前关键段完成并取消任务上下文，再等任务返回。业务应在步骤之间检查取消，休息时使用可取消的等待。传入的停止期限不会提前结束等待；任务始终不返回，停机也会继续等待。不能在被等待的任务中调用 `Stop`；任务自行启动的 goroutine 应由任务等待完成后再返回。
 
 持锁标记区分每个 `Stage`。派生上下文只用于外层调用期间的同步嵌套调用，不要在外层返回后复用，也不要传给独立运行的 goroutine。
 
@@ -148,7 +152,7 @@ srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 
 ```go
 stage.Do(ctx, func(ctx context.Context) {
-    helperUsingStage(ctx, stage)  // 内层 stage.Do 看到标记,跳过重新加锁
+    processBatch(ctx, stage)  // 内层 stage.Do 看到标记,跳过重新加锁
 })
 ```
 
@@ -175,9 +179,9 @@ app := kratos.New(
 )
 ```
 
-`Start` 跟 `Stop` 由 Kratos 生命周期驱动。启动前完成任务注册，每个实例使用一次启动与停止流程；注册和生命周期方法不并发调用。停止后如需重新启动，应创建新实例。
+`Start` 跟 `Stop` 由 Kratos 生命周期驱动。生命周期操作前完成任务注册；实例内部串行协调启动与停止，重复调用不重复执行。停止后如需重新启动，应创建新实例。
 
-启动任务不在 cron 自身的运行跟踪范围内，关停时只通过锁等待它们正在执行的 `Stage.Do` 关键段。传给 `cron.WithChain` 的包装只作用于定时执行，不覆盖启动执行；本包的任务选项则覆盖两条路径。
+启动任务由本包跟踪，关停时与定时任务一起等待完成。传给 `cron.WithChain` 的包装只作用于定时执行，不覆盖启动执行；本包的任务选项则覆盖两条路径。
 
 ## 设计说明
 
@@ -185,9 +189,9 @@ app := kratos.New(
 
 `Server.Stop` 按顺序跑三步:
 
-1. **`cron.Stop()`** — 停止调度新任务。返回的 ctx 在所有运行中的 cron 任务完成时 done。这一步监听 `Stop` 自己传入的 ctx — 超时只打个 warn 日志,仍会继续走第 2 步(`mutex.Lock` 不看 ctx,该等多久还等多久)。
-2. **`mutex.Lock()`** — 拿写锁,等所有读锁持有者(运行中的 `stage.Do` 回调)释放。
-3. **`cancel()`** — 取消 Server 的 ctx。
+1. **`cron.Stop()`** — 停止调度新任务，不等待下一次定时触发。
+2. **`mutex.Lock()` + `cancel()` + `mutex.Unlock()`** — 等当前关键段完成，持写锁取消任务上下文，然后释放写锁。
+3. **等待任务返回** — 等定时和启动任务连同其 defer 完成。外部强制结束进程无法保证这一流程完成。
 
 写锁保证关停流程不会在正在执行的关键段内取消上下文；它不会恢复已经取消的上下文，也不能阻止调用方自行设置的期限到期。
 
@@ -202,7 +206,7 @@ app := kratos.New(
 
 | 底层细节                                 | 内部处理                                      |
 | ---------------------------------------- | --------------------------------------------- |
-| 任务异常与跳过日志                       | 使用传入的 `*slog.Logger`                    |
+| 任务异常与跳过日志                       | 使用传入的 `*slog.Logger`                     |
 | `cron.WithChain(cron.Recover(...))` 配线 | 替换成 `Recoverable()` / `WithRecover()` 选项 |
 | `defer recover()` 模板代码               | `wrapRecoverable` 在任一开关启用时自动加      |
 | `sync.RWMutex` + `RLocker` 管线          | 封装在 `Stage.Do` 里                          |
@@ -280,6 +284,7 @@ MIT 许可证 - 详见 [LICENSE](LICENSE)。
 ---
 
 <!-- TEMPLATE (ZH) BEGIN: GITHUB STARS -->
+
 ## GitHub 标星点赞
 
 [![Stargazers](https://starchart.cc/yylego/kratos-cron.svg?variant=adaptive)](https://starchart.cc/yylego/kratos-cron)
