@@ -46,7 +46,7 @@ func TestStopBeforeFirstRun(t *testing.T) {
 	t.Run("no active task", func(t *testing.T) {
 		srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default())
 		ran := false
-		_, err := srv.AddFunc("@every 24h", func(context.Context, *cronkratos.Stage) { ran = true })
+		_, err := srv.AddFunc("0 0 0 1 1 *", func(context.Context, *cronkratos.Stage) { ran = true })
 		require.NoError(t, err)
 		require.NoError(t, srv.Start(context.Background()))
 		require.NoError(t, srv.Stop(context.Background()))
@@ -69,10 +69,10 @@ func TestStopAwaitsStepAndTask(t *testing.T) {
 				cleaned := false
 				ranNext := false
 				opts := []cronkratos.TaskOption{}
-				spec := "@every 1s"
+				spec := "* * * * * *"
 				if startup {
 					opts = append(opts, cronkratos.DoOnStartup())
-					spec = "@every 24h"
+					spec = "0 0 0 1 1 *"
 				}
 				_, err := srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 					defer func() {
@@ -99,8 +99,8 @@ func TestStopAwaitsStepAndTask(t *testing.T) {
 				cancel()
 				go func() { stopped <- srv.Stop(stopCtx) }()
 				select {
-				case <-stopped:
-					t.Fatal("Stop returned before the active step completed")
+				case cause := <-stopped:
+					t.Fatalf("Stop returned before the active step completed: %v", cause)
 				case <-time.After(20 * time.Millisecond):
 				}
 				require.NoError(t, ctx.Err())
@@ -109,8 +109,8 @@ func TestStopAwaitsStepAndTask(t *testing.T) {
 				<-ctx.Done()
 				require.ErrorIs(t, ctx.Err(), context.Canceled)
 				select {
-				case <-stopped:
-					t.Fatal("Stop returned before task cleanup completed")
+				case cause := <-stopped:
+					t.Fatalf("Stop returned before task cleanup completed: %v", cause)
 				case <-time.After(20 * time.Millisecond):
 				}
 				close(finishTask)

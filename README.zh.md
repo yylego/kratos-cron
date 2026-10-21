@@ -6,6 +6,7 @@
 [![Supported Go Versions](https://img.shields.io/badge/Go-1.25%2B-lightgrey.svg)](https://go.dev/)
 [![GitHub Release](https://img.shields.io/github/release/yylego/kratos-cron.svg)](https://github.com/yylego/kratos-cron/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yylego/kratos-cron)](https://goreportcard.com/report/github.com/yylego/kratos-cron)
+
 <!-- TEMPLATE (ZH) CLOSE: BADGES -->
 
 # kratos-cron
@@ -66,9 +67,6 @@ func main() {
 
 	rese.C1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
 		stage.Do(ctx, func(ctx context.Context) {
-			if ctx.Err() != nil {
-				return
-			}
 			// 业务逻辑 — 防止关停流程在关键段内取消上下文
 		})
 	}, cronkratos.DoOnStartup()))
@@ -127,22 +125,21 @@ rese.C1(srv.AddFunc(spec, fn, cronkratos.WithName("数据同步"), cronkratos.Sk
 ```go
 srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
     for _, item := range list {
-        if ctx.Err() != nil {
+        if !stage.Do(ctx, func(ctx context.Context) {
+            process(ctx, item)
+        }) {
             return
         }
-        stage.Do(ctx, func(ctx context.Context) {
-            if ctx.Err() != nil {
-                return
-            }
-            process(ctx, item)
-        })
+        if cronkratos.Sleep(ctx, pause) != nil {
+            return
+        }
     }
 })
 ```
 
-`stage.Do` 在 fn 执行期间持 Server 的读锁。`Server.Stop()` 必须先拿写锁再取消自身上下文，因此会等待正在执行的关键段。进入回调时仍须检查 `ctx.Err()`：上下文可能在进入前已被取消，业务自行派生的上下文也可能独立超时。
+`stage.Do` 在 fn 执行期间持 Server 的读锁。`Server.Stop()` 必须先拿写锁再取消自身上下文，因此会等待正在执行的关键段。`ctx` 已结束时 `stage.Do` 不执行 fn 并返回 `false`：加锁前检查一次，拿到锁后再检查一次，因为排在 `Stop` 后面的调用拿到锁时，上下文恰好刚被取消。fn 执行了返回 `true`。业务自行派生的上下文仍可能在 fn 执行期间超时，较长的回调须自行检查 `ctx.Err()`。
 
-`Stop` 先等当前关键段完成并取消任务上下文，再等任务返回。业务应在步骤之间检查取消，休息时使用可取消的等待。传入的停止期限不会提前结束等待；任务始终不返回，停机也会继续等待。不能在被等待的任务中调用 `Stop`；任务自行启动的 goroutine 应由任务等待完成后再返回。
+`Stop` 先等当前关键段完成并取消任务上下文，再等任务返回。业务应在步骤之间检查取消，休息时使用可取消的等待：`cronkratos.Sleep(ctx, d)` 在上下文取消时立即返回 `ctx.Err()`。它应放在两次 `stage.Do` 之间调用，关键段内部的等待会让关停一直等到它结束。传入的停止期限不会提前结束等待；任务始终不返回，停机也会继续等待。不能在被等待的任务中调用 `Stop`；任务自行启动的 goroutine 应由任务等待完成后再返回。
 
 持锁标记区分每个 `Stage`。派生上下文只用于外层调用期间的同步嵌套调用，不要在外层返回后复用，也不要传给独立运行的 goroutine。
 
@@ -194,6 +191,8 @@ app := kratos.New(
 3. **等待任务返回** — 等定时和启动任务连同其 defer 完成。外部强制结束进程无法保证这一流程完成。
 
 写锁保证关停流程不会在正在执行的关键段内取消上下文；它不会恢复已经取消的上下文，也不能阻止调用方自行设置的期限到期。
+
+等待期间 `Stop` 会记录仍在执行的任务（`WithName` 的名称，没有则用 spec，附已运行时长）：开始时（`cron stopping`）、取消上下文后（`cron context cancelled`）、每个任务退出时（`cron task exited`）以及每隔 2 秒（`cron awaiting tasks`）；`cron shutdown complete` 带上总等待时长。进程被托管程序强制结束时，最后几行日志就能看出是哪个任务拖住了关停。
 
 ### `Stage.Do` 的封装职责
 
@@ -280,12 +279,3 @@ MIT 许可证 - 详见 [LICENSE](LICENSE)。
 **祝你用这个包编程愉快！** 🎉🎉🎉
 
 <!-- TEMPLATE (ZH) CLOSE: STANDARD PROJECT FOOTER -->
-
----
-
-<!-- TEMPLATE (ZH) BEGIN: GITHUB STARS -->
-
-## GitHub 标星点赞
-
-[![Stargazers](https://starchart.cc/yylego/kratos-cron.svg?variant=adaptive)](https://starchart.cc/yylego/kratos-cron)
-<!-- TEMPLATE (ZH) CLOSE: GITHUB STARS -->

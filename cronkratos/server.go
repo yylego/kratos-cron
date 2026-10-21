@@ -22,7 +22,6 @@
 //	// stage.Do holds the read-lock so Stop waits—fn returns before cancelling ctx.
 //	rese.V1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
 //	    stage.Do(ctx, func(ctx context.Context) {
-//	        if ctx.Err() != nil { return }
 //	        // business logic
 //	    })
 //	}, cronkratos.DoOnStartup(), cronkratos.Recoverable()))
@@ -56,7 +55,6 @@
 //	// stage.Do 持读锁,Stop 会等 fn 返回再 cancel ctx
 //	rese.V1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
 //	    stage.Do(ctx, func(ctx context.Context) {
-//	        if ctx.Err() != nil { return }
 //	        // 业务逻辑
 //	    })
 //	}, cronkratos.DoOnStartup(), cronkratos.Recoverable()))
@@ -69,6 +67,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/robfig/cron/v3"
 	"github.com/yylego/erero"
@@ -97,6 +96,9 @@ type Server struct {
 	stopped     bool
 	recoverable bool   // service-side default panic catch flag // 服务级默认 recover 开关
 	stage       *Stage // shared lock-stage aid injected into each AddFunc cmd // 注入到每个 task 的锁阶段辅助
+	activeMutex sync.Mutex
+	active      map[*activeRun]struct{} // runs in progress, reported while Stop waits // 正在执行的任务，Stop 等待时报出
+	stopping    bool                    // activeMutex guards it // 由 activeMutex 保护
 }
 
 // NewServer constructs a Server wrapping the supplied cron instance.
@@ -126,6 +128,7 @@ func NewServer(c *cron.Cron, slog *slog.Logger, opts ...ServerOption) *Server {
 		startupRuns: nil,
 		recoverable: cfg.recoverable,
 		stage:       NewStage(mutex.RLocker()),
+		active:      map[*activeRun]struct{}{},
 	}
 }
 
@@ -178,6 +181,7 @@ func (s *Server) AddFunc(spec string, cmd func(ctx context.Context, stage *Stage
 		}
 		cmd(s.ctx, s.stage)
 	}
+	runFunc = s.wrapActive(spec, cfg.name, runFunc)
 	if s.recoverable || cfg.recoverable {
 		runFunc = s.wrapRecoverable(spec, cfg.name, runFunc)
 	}
@@ -239,10 +243,15 @@ func (s *Server) Start(_ context.Context) error {
 // The supplied deadline does not cut this wait short. Tasks must observe cancellation
 // between protected steps; Stop must not be called from a task it waits on.
 // Tasks must join detached goroutines before returning.
+// While waiting, Stop logs the active runs (name, else spec, plus elapsed time)
+// at the start, on cancellation, on each run exit and once each awaitReportDuration,
+// so even a forced termination leaves the task that held up shutdown in the logs.
 //
 // Stop 停止调度,等当前 Stage.Do 完成后取消任务上下文,再等定时和启动任务及其 defer 完成。
 // 传入的期限不会提前结束等待;业务须在步骤之间响应取消,不能在任务内部调用 Stop。
 // 任务自行启动的 goroutine 须由任务等待完成后再返回;强制结束进程无法保证收尾。
+// 等待期间在开始、取消上下文、每个任务退出时以及每隔 awaitReportDuration 记录仍在执行的任务
+// (业务名，没有则用 spec，附已运行时长)，被强制结束时也能看出是谁拖住了关停。
 func (s *Server) Stop(_ context.Context) error {
 	s.lifecycle.Lock()
 	defer s.lifecycle.Unlock()
@@ -250,14 +259,33 @@ func (s *Server) Stop(_ context.Context) error {
 		return nil
 	}
 	s.stopped = true
-	s.slog.Info("cron stopping")
+	begin := time.Now()
+	s.activeMutex.Lock()
+	s.stopping = true
+	s.activeMutex.Unlock()
+	s.slog.Info("cron stopping", "active", s.activeRuns())
 
 	stopCtx := s.cron.Stop()
-	s.mutex.Lock()
-	s.cancel()
-	s.mutex.Unlock()
-	<-stopCtx.Done()
-	s.startupDone.Wait()
-	s.slog.Info("cron shutdown complete")
-	return nil
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		s.mutex.Lock()
+		s.cancel()
+		s.mutex.Unlock()
+		s.slog.Info("cron context cancelled", "waited", time.Since(begin), "active", s.activeRuns())
+		<-stopCtx.Done()
+		s.startupDone.Wait()
+	}()
+
+	pulse := time.NewTicker(awaitReportDuration)
+	defer pulse.Stop()
+	for {
+		select {
+		case <-finished:
+			s.slog.Info("cron shutdown complete", "waited", time.Since(begin))
+			return nil
+		case <-pulse.C:
+			s.slog.Info("cron awaiting tasks", "waited", time.Since(begin), "active", s.activeRuns())
+		}
+	}
 }

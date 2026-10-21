@@ -6,6 +6,7 @@
 [![Supported Go Versions](https://img.shields.io/badge/Go-1.25%2B-lightgrey.svg)](https://go.dev/)
 [![GitHub Release](https://img.shields.io/github/release/yylego/kratos-cron.svg)](https://github.com/yylego/kratos-cron/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yylego/kratos-cron)](https://goreportcard.com/report/github.com/yylego/kratos-cron)
+
 <!-- TEMPLATE (EN) CLOSE: BADGES -->
 
 # kratos-cron
@@ -66,9 +67,6 @@ func main() {
 
 	rese.C1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
 		stage.Do(ctx, func(ctx context.Context) {
-			if ctx.Err() != nil {
-				return
-			}
 			// business logic — protected against shutdown cancellation
 		})
 	}, cronkratos.DoOnStartup()))
@@ -127,22 +125,21 @@ Wrap hot sections with `stage.Do(ctx, fn)`:
 ```go
 srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
     for _, item := range list {
-        if ctx.Err() != nil {
+        if !stage.Do(ctx, func(ctx context.Context) {
+            process(ctx, item)
+        }) {
             return
         }
-        stage.Do(ctx, func(ctx context.Context) {
-            if ctx.Err() != nil {
-                return
-            }
-            process(ctx, item)
-        })
+        if cronkratos.Sleep(ctx, pause) != nil {
+            return
+        }
     }
 })
 ```
 
-`stage.Do` holds the Server's read-lock during `fn`. `Server.Stop()` acquires the write lock before cancelling its context, so active protected sections finish first. Check `ctx.Err()` inside the callback: shutdown cancellation can precede lock acquisition, and a derived context can expire on its own.
+`stage.Do` holds the Server's read-lock during `fn`. `Server.Stop()` acquires the write lock before cancelling its context, so active protected sections finish first. Once `ctx` is done, `stage.Do` skips `fn` and returns `false`: it checks before locking and again on acquiring the lock, since a call queued behind `Stop` gets the lock right as the context is cancelled. It returns `true` when `fn` ran. A derived context can still expire while `fn` runs, so long callbacks check `ctx.Err()` themselves.
 
-`Stop` awaits active protected steps before cancelling the task context, then awaits task completion. Check cancellation between steps and use cancellable waits. The supplied stop deadline does not end this wait; a task that remains active prevents shutdown. Tasks must not invoke `Stop` on the instance that runs them, and must join spawned goroutines before returning.
+`Stop` awaits active protected steps before cancelling the task context, then awaits task completion. Check cancellation between steps and use cancellable waits: `cronkratos.Sleep(ctx, d)` returns `ctx.Err()` as soon as the context is cancelled. Call it between `stage.Do` steps; a wait inside a protected step holds up shutdown to its end. The supplied stop deadline does not end this wait; a task that remains active prevents shutdown. Tasks must not invoke `Stop` on the instance that runs them, and must join spawned goroutines before returning.
 
 Holding tags distinguish each `Stage`. Use the derived context within synchronous nested invocations while the enclosing callback remains active. Do not retain it beyond that scope; do not pass it to independent goroutines.
 
@@ -194,6 +191,8 @@ This package tracks startup tasks and awaits them on shutdown alongside schedule
 3. **Await completion** — awaits scheduled and startup tasks, including deferred work. Forced process termination cannot preserve this guarantee.
 
 The write lock prevents shutdown cancellation during an active protected section. It cannot undo existing cancellation and does not suppress deadlines on derived contexts.
+
+While waiting, `Stop` logs the active runs (the `WithName` name, else the spec, plus elapsed time) at the start (`cron stopping`), after cancellation (`cron context cancelled`), on each run exit (`cron task exited`) and every 2 seconds (`cron awaiting tasks`); `cron shutdown complete` carries the total wait. When a process supervisor force-kills the service, the last lines show which task held up shutdown.
 
 ### Stage.Do — picked instead of a raw mutex
 
@@ -280,12 +279,3 @@ Welcome to contribute to this project via submitting merge requests and reportin
 **Have Fun Coding with this package!** 🎉🎉🎉
 
 <!-- TEMPLATE (EN) CLOSE: STANDARD PROJECT FOOTER -->
-
----
-
-<!-- TEMPLATE (EN) BEGIN: GITHUB STARS -->
-
-## GitHub Stars
-
-[![Stargazers](https://starchart.cc/yylego/kratos-cron.svg?variant=adaptive)](https://starchart.cc/yylego/kratos-cron)
-<!-- TEMPLATE (EN) CLOSE: GITHUB STARS -->

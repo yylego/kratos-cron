@@ -3,6 +3,7 @@ package cronkratos
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // Stage is the task-scope lock-stage aid injected into each cmd added
@@ -59,25 +60,31 @@ type stageHoldingTag struct{ stage *Stage }
 // avoids the nested-RLock deadlock that would otherwise arise with a
 // concurrent Stop. The lock is held just while fn executes; Stop() blocks
 // on the write lock while fn executes, preventing shutdown cancellation mid-task.
-// Check ctx.Err() inside fn: cancellation and derived context deadlines remain possible.
+// Do skips fn and returns false once ctx is done: it checks before locking and
+// once more on acquiring the lock, since a Do queued behind a pending Stop gets
+// the lock just as Stop cancels the task context. It returns true when fn ran.
+// Check ctx.Err() inside fn: derived context deadlines can expire while fn runs.
 // Pass the tagged ctx through synchronous nested calls while the enclosing Do remains active.
 // Do not retain this ctx beyond that scope; do not pass it to independent goroutines.
 //
 // Do 检测 ctx 上的"持锁中"标记:首次调用加读锁并把标记注入 ctx 传给 fn;
 // 同一个 Stage 同步嵌套时，ctx 已有对应标记，直接执行 fn 不再加锁。
 // Stop() 拿写锁会等 fn 返回，避免关停流程在关键段中途取消上下文。
-// 进入时仍须检查 ctx.Err()：ctx 可能早已取消，或有独立的超时期限。
+// ctx 已结束时 Do 不执行 fn 并返回 false：加锁前查一次，拿到锁后再查一次——
+// 等在 Stop 后面的 Do 拿到锁时，Stop 刚好取消了任务上下文。fn 执行了返回 true。
+// fn 内仍须检查 ctx.Err()：派生的超时期限可能在 fn 执行期间到期。
 // 带标记的 ctx 只用于外层 Do 尚未返回时的同步嵌套，不传给独立 goroutine，也不在外层返回后复用。
 //
 // Sample pattern (each-iteration locking inside a long-running cron task):
 //
 //	srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 //	    for _, item := range list {
-//	        if ctx.Err() != nil { return }
-//	        stage.Do(ctx, func(ctx context.Context) {
-//	            if ctx.Err() != nil { return }
+//	        if !stage.Do(ctx, func(ctx context.Context) {
 //	            // process item inside the read-lock
-//	        })
+//	        }) {
+//	            return
+//	        }
+//	        if cronkratos.Sleep(ctx, pause) != nil { return }
 //	    }
 //	})
 //
@@ -85,11 +92,12 @@ type stageHoldingTag struct{ stage *Stage }
 //
 //	srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 //	    for _, item := range list {
-//	        if ctx.Err() != nil { return }
-//	        stage.Do(ctx, func(ctx context.Context) {
-//	            if ctx.Err() != nil { return }
+//	        if !stage.Do(ctx, func(ctx context.Context) {
 //	            // 持读锁内处理 item
-//	        })
+//	        }) {
+//	            return
+//	        }
+//	        if cronkratos.Sleep(ctx, pause) != nil { return }
 //	    }
 //	})
 //
@@ -147,13 +155,40 @@ type stageHoldingTag struct{ stage *Stage }
 // 由 Server 的 wrapRecoverable 统一兜 panic, 把 "panic 处理" 这件事集中在 Server 这一层,
 // Stage 保持专注于锁语义本身. Go 标准库的同步原语 (sync.Mutex / sync.RWMutex)
 // 也都是这个立场 — 不替调用方兜 panic
-func (s *Stage) Do(ctx context.Context, fn func(ctx context.Context)) {
+func (s *Stage) Do(ctx context.Context, fn func(ctx context.Context)) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	tag := stageHoldingTag{stage: s}
 	if ctx.Value(tag) != nil {
 		fn(ctx)
-		return
+		return true
 	}
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
+	if ctx.Err() != nil {
+		return false
+	}
 	fn(context.WithValue(ctx, tag, struct{}{}))
+	return true
+}
+
+// Sleep waits d and returns nil; once ctx is done it returns ctx.Err() at once.
+// Call it between Stage.Do steps: inside Do, Stop waits on the step before
+// cancelling ctx, so a sleep there holds up shutdown to its end.
+//
+// Sleep 等待 d 后返回 nil；ctx 结束时立即返回 ctx.Err()。
+// 放在两次 Stage.Do 之间调用：Do 内部的等待会让 Stop 一直等到它结束才取消 ctx。
+func Sleep(ctx context.Context, d time.Duration) error {
+	if cause := ctx.Err(); cause != nil {
+		return cause
+	}
+	wake := time.NewTimer(d)
+	defer wake.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-wake.C:
+		return nil
+	}
 }
