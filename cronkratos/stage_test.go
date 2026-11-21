@@ -83,22 +83,22 @@ func TestDoQueuedBehindStop(t *testing.T) {
 	<-stopped
 }
 
-// TestSleep verifies Sleep waits the whole span, and returns the ctx cause at once when ctx ends.
+// TestSleepContext verifies SleepContext waits the whole span, and returns the ctx cause at once when ctx ends.
 //
-// TestSleep 验证 Sleep 正常睡满，ctx 结束时立即返回原因。
-func TestSleep(t *testing.T) {
+// TestSleepContext 验证 SleepContext 正常睡满，ctx 结束时立即返回原因。
+func TestSleepContext(t *testing.T) {
 	start := time.Now()
-	require.NoError(t, cronkratos.Sleep(context.Background(), 30*time.Millisecond))
+	require.NoError(t, cronkratos.SleepContext(context.Background(), 30*time.Millisecond))
 	require.GreaterOrEqual(t, time.Since(start), 30*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	require.ErrorIs(t, cronkratos.Sleep(ctx, time.Hour), context.Canceled)
+	require.ErrorIs(t, cronkratos.SleepContext(ctx, time.Hour), context.Canceled)
 
 	ctx, cancel = context.WithCancel(context.Background())
 	time.AfterFunc(20*time.Millisecond, cancel)
 	start = time.Now()
-	require.ErrorIs(t, cronkratos.Sleep(ctx, time.Hour), context.Canceled)
+	require.ErrorIs(t, cronkratos.SleepContext(ctx, time.Hour), context.Canceled)
 	require.Less(t, time.Since(start), time.Second)
 }
 
@@ -108,11 +108,11 @@ func TestSleep(t *testing.T) {
 // TestNonStage_DoesNotBlock 验证 NonStage 的 Do 不会阻塞 — noopMutex 的 Lock/Unlock 都是空操作
 func TestNonStage_DoesNotBlock(t *testing.T) {
 	stage := cronkratos.NonStage()
-	var ran int32
+	var ran atomic.Int32
 	stage.Do(context.Background(), func(_ context.Context) {
-		atomic.StoreInt32(&ran, 1)
+		ran.Store(1)
 	})
-	require.Equal(t, int32(1), atomic.LoadInt32(&ran))
+	require.Equal(t, int32(1), ran.Load())
 }
 
 // TestNonStage_NestedDoOK verifies nested Do on a NonStage works -
@@ -121,11 +121,11 @@ func TestNonStage_DoesNotBlock(t *testing.T) {
 // TestNonStage_NestedDoOK 验证 NonStage 嵌套 Do 没问题 — ctx 标记防嵌套机制照常生效
 func TestNonStage_NestedDoOK(t *testing.T) {
 	stage := cronkratos.NonStage()
-	var nestRan int32
+	var nestRan atomic.Int32
 	stage.Do(context.Background(), func(ctx context.Context) {
 		stage.Do(ctx, func(_ context.Context) {
-			atomic.StoreInt32(&nestRan, 1)
+			nestRan.Store(1)
 		})
 	})
-	require.Equal(t, int32(1), atomic.LoadInt32(&nestRan))
+	require.Equal(t, int32(1), nestRan.Load())
 }

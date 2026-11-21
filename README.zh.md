@@ -111,8 +111,8 @@ srv := cronkratos.NewServer(c, slog, cronkratos.WithRecover())
 两层用 **OR** 组合:任一开启就包 defer recover。两层都没配置的任务裸跑,panic 按 goroutine 默认行为传播。
 
 `WithName("数据同步")` 为异常和跳过日志添加业务名称，捕获的 panic 同时记录堆栈。
-两项默认均不开启。被跳过的执行不排队、不补跑。HTTP 接口直接调用业务函数时不经过门控，需要统一互斥时应放在业务共同入口。任务一直不返回时会一直占用门控；本选项不负责超时或取消任务。
 `SkipIfRunning()` 跳过同一注册项在当前进程中的重叠执行，也覆盖 `DoOnStartup()`。跳过时记录已运行时长，任务返回或 panic 时释放门控，不取消正在运行的任务。同名的不同注册项相互独立，不提供分布式锁；任务另起 goroutine 时，必须在任务函数中等待它结束，门控才会覆盖这部分工作。
+两项默认均不开启。被跳过的执行不排队、不补跑。HTTP 接口直接调用业务函数时不经过门控，需要统一互斥时应放在业务共同入口。任务一直不返回时会一直占用门控；`SkipIfRunning()` 不负责超时或取消任务。
 
 ```go
 rese.C1(srv.AddFunc(spec, fn, cronkratos.WithName("数据同步"), cronkratos.SkipIfRunning(), cronkratos.Recoverable()))
@@ -130,7 +130,7 @@ srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
         }) {
             return
         }
-        if cronkratos.Sleep(ctx, pause) != nil {
+        if cronkratos.SleepContext(ctx, pause) != nil {
             return
         }
     }
@@ -139,7 +139,7 @@ srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 
 `stage.Do` 在 fn 执行期间持 Server 的读锁。`Server.Stop()` 必须先拿写锁再取消自身上下文，因此会等待正在执行的关键段。`ctx` 已结束时 `stage.Do` 不执行 fn 并返回 `false`：加锁前检查一次，拿到锁后再检查一次，因为排在 `Stop` 后面的调用拿到锁时，上下文恰好刚被取消。fn 执行了返回 `true`。业务自行派生的上下文仍可能在 fn 执行期间超时，较长的回调须自行检查 `ctx.Err()`。
 
-`Stop` 先等当前关键段完成并取消任务上下文，再等任务返回。业务应在步骤之间检查取消，休息时使用可取消的等待：`cronkratos.Sleep(ctx, d)` 在上下文取消时立即返回 `ctx.Err()`。它应放在两次 `stage.Do` 之间调用，关键段内部的等待会让关停一直等到它结束。传入的停止期限不会提前结束等待；任务始终不返回，停机也会继续等待。不能在被等待的任务中调用 `Stop`；任务自行启动的 goroutine 应由任务等待完成后再返回。
+`Stop` 先等当前关键段完成并取消任务上下文，再等任务返回。业务应在步骤之间检查取消，休息时使用可取消的等待：`cronkratos.SleepContext(ctx, d)` 在上下文取消时立即返回 `ctx.Err()`。它应放在两次 `stage.Do` 之间调用，关键段内部的等待会让关停一直等到它结束。传入的停止期限不会提前结束等待；任务始终不返回，停机也会继续等待。不能在被等待的任务中调用 `Stop`；任务自行启动的 goroutine 应由任务等待完成后再返回。
 
 持锁标记区分每个 `Stage`。派生上下文只用于外层调用期间的同步嵌套调用，不要在外层返回后复用，也不要传给独立运行的 goroutine。
 
@@ -216,7 +216,7 @@ app := kratos.New(
 
 ## 演示
 
-完整的 Kratos 集成示例见 [kratos-cron-demos](https://github.com/yylego/kratos-cron-demos)。
+完整的 Kratos 集成示例见 [kratos-examples/cron](https://github.com/kratos-examples/cron)。
 
 ---
 

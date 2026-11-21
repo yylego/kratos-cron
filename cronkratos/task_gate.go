@@ -21,6 +21,8 @@ func (s *Server) wrapRecoverable(spec, name string, cmd func()) func() {
 	}
 }
 
+// wrapSkipRunning lets one run of this registration go at a time; a run that comes while one is going logs a skip and returns.
+// wrapSkipRunning 让同一注册项同时只跑一次；有一次正在跑时，新来的那次记一条跳过日志后直接返回。
 func (s *Server) wrapSkipRunning(spec, name string, cmd func()) func() {
 	var active atomic.Pointer[time.Time]
 	return func() {

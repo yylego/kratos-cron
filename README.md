@@ -111,8 +111,8 @@ srv := cronkratos.NewServer(c, slog, cronkratos.WithRecover())
 The two compose with **OR** semantics: one flag is enough. A task with no flag set runs raw — panics propagate as standard.
 
 `WithName("sync-data")` adds a business name to panic and skip logs. Caught panics include a stack trace.
-Both options are opt-in. Skipped runs are not queued / replayed. Direct HTTP calls bypass this gate; put shared exclusion in the common business function when needed. The gate remains occupied throughout execution; this option imposes no timeout and does not stop active work.
 `SkipIfRunning()` skips overlapping runs of the same registration within one process, including `DoOnStartup()` runs. It logs the elapsed time of active work and releases the gate on return / panic. Active work continues unchanged. Separate registrations remain independent even with matching names; this is not a distributed lock. Work launched in a separate goroutine must be awaited inside the task to remain within the gate.
+Both options are opt-in. Skipped runs are not queued / replayed. Direct HTTP calls bypass this gate; put shared exclusion in the common business function when needed. The gate remains occupied throughout execution; `SkipIfRunning()` imposes no timeout and does not stop active work.
 
 ```go
 rese.C1(srv.AddFunc(spec, fn, cronkratos.WithName("sync-data"), cronkratos.SkipIfRunning(), cronkratos.Recoverable()))
@@ -130,7 +130,7 @@ srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
         }) {
             return
         }
-        if cronkratos.Sleep(ctx, pause) != nil {
+        if cronkratos.SleepContext(ctx, pause) != nil {
             return
         }
     }
@@ -139,7 +139,7 @@ srv.AddFunc(spec, func(ctx context.Context, stage *cronkratos.Stage) {
 
 `stage.Do` holds the Server's read-lock during `fn`. `Server.Stop()` acquires the write lock before cancelling its context, so active protected sections finish first. Once `ctx` is done, `stage.Do` skips `fn` and returns `false`: it checks before locking and again on acquiring the lock, since a call queued behind `Stop` gets the lock right as the context is cancelled. It returns `true` when `fn` ran. A derived context can still expire while `fn` runs, so long callbacks check `ctx.Err()` themselves.
 
-`Stop` awaits active protected steps before cancelling the task context, then awaits task completion. Check cancellation between steps and use cancellable waits: `cronkratos.Sleep(ctx, d)` returns `ctx.Err()` as soon as the context is cancelled. Call it between `stage.Do` steps; a wait inside a protected step holds up shutdown to its end. The supplied stop deadline does not end this wait; a task that remains active prevents shutdown. Tasks must not invoke `Stop` on the instance that runs them, and must join spawned goroutines before returning.
+`Stop` awaits active protected steps before cancelling the task context, then awaits task completion. Check cancellation between steps and use cancellable waits: `cronkratos.SleepContext(ctx, d)` returns `ctx.Err()` as soon as the context is cancelled. Use it between `stage.Do` steps; a wait inside a protected step holds up shutdown to its end. The supplied stop deadline does not end this wait; a task that remains active prevents shutdown. Tasks must not invoke `Stop` on the instance that runs them, and must join spawned goroutines before returning.
 
 Holding tags distinguish each `Stage`. Use the derived context within synchronous nested invocations while the enclosing callback remains active. Do not retain it beyond that scope; do not pass it to independent goroutines.
 
@@ -201,7 +201,7 @@ Two reasons:
 - **Hides the lock.** Business code does not touch `sync.RWMutex` / `RLocker` / write-lock semantics. The sole API surface is `stage.Do(ctx, fn)`.
 - **Solves nested reentrance.** `sync.RWMutex.RLock` is _not_ reentrant — with a concurrent `Lock`, a second `RLock` on the same goroutine deadlocks (`Lock`-starvation prevention). `Stage.Do` carries a private tag on `ctx`; nested calls see the tag and skip re-locking, eliminating the deadlock.
 
-### What `cronkratos` hides from the business side
+### Details `cronkratos` Takes Off the Business Side
 
 | Underlying concern                         | Handled in here                                        |
 | ------------------------------------------ | ------------------------------------------------------ |
@@ -216,7 +216,7 @@ The underlying cron instance retains its own logging configuration; this package
 
 ## Demo
 
-See [kratos-cron-demos](https://github.com/yylego/kratos-cron-demos) — a complete Kratos integration example.
+See [kratos-examples/cron](https://github.com/kratos-examples/cron) — a complete Kratos integration example.
 
 ---
 

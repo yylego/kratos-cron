@@ -24,22 +24,22 @@ func TestBasicTwoTasks(t *testing.T) {
 		cronkratos.WithRecover(),
 	)
 
-	var startupCount, scheduledCount int32
+	var startupCount, scheduledCount atomic.Int32
 
 	rese.C1(srv.AddFunc("* * * * * *", func(_ context.Context, _ *cronkratos.Stage) {
-		atomic.AddInt32(&startupCount, 1)
+		startupCount.Add(1)
 	}, cronkratos.DoOnStartup()))
 
 	rese.C1(srv.AddFunc("* * * * * *", func(_ context.Context, _ *cronkratos.Stage) {
-		atomic.AddInt32(&scheduledCount, 1)
+		scheduledCount.Add(1)
 	}))
 
 	require.NoError(t, srv.Start(context.Background()))
 	time.Sleep(2500 * time.Millisecond)
 	require.NoError(t, srv.Stop(context.Background()))
 
-	require.GreaterOrEqual(t, atomic.LoadInt32(&startupCount), int32(3))
-	require.GreaterOrEqual(t, atomic.LoadInt32(&scheduledCount), int32(2))
+	require.GreaterOrEqual(t, startupCount.Load(), int32(3))
+	require.GreaterOrEqual(t, scheduledCount.Load(), int32(2))
 }
 
 func TestStopBeforeFirstRun(t *testing.T) {
@@ -131,7 +131,7 @@ func TestStageCoordinatesShutdown(t *testing.T) {
 
 	taskRunning := make(chan struct{})
 	var taskOnce sync.Once
-	var ctxValidAtEnd int32
+	var ctxValidAtEnd atomic.Int32
 
 	rese.C1(srv.AddFunc("* * * * * *", func(ctx context.Context, stage *cronkratos.Stage) {
 		stage.Do(ctx, func(ctx context.Context) {
@@ -140,14 +140,14 @@ func TestStageCoordinatesShutdown(t *testing.T) {
 			if ctx.Err() != nil {
 				return
 			}
-			atomic.StoreInt32(&ctxValidAtEnd, 1)
+			ctxValidAtEnd.Store(1)
 		})
 	}))
 
 	require.NoError(t, srv.Start(context.Background()))
 	<-taskRunning
 	require.NoError(t, srv.Stop(context.Background()))
-	require.Equal(t, int32(1), atomic.LoadInt32(&ctxValidAtEnd))
+	require.Equal(t, int32(1), ctxValidAtEnd.Load())
 }
 
 // TestStopAwaitsCompletionDespiteTimeout checks that a stop deadline does not cut short an active step.
@@ -185,11 +185,11 @@ func TestStopAwaitsCompletionDespiteTimeout(t *testing.T) {
 func TestStageNestedDoNoDeadlock(t *testing.T) {
 	srv := cronkratos.NewServer(cron.New(cron.WithSeconds()), slog.Default())
 
-	var nestedRan int32
+	var nestedRan atomic.Int32
 	rese.C1(srv.AddFunc("* * * * * *", func(ctx context.Context, stage *cronkratos.Stage) {
 		stage.Do(ctx, func(ctx context.Context) {
 			stage.Do(ctx, func(_ context.Context) {
-				atomic.StoreInt32(&nestedRan, 1)
+				nestedRan.Store(1)
 			})
 		})
 	}))
@@ -197,7 +197,7 @@ func TestStageNestedDoNoDeadlock(t *testing.T) {
 	require.NoError(t, srv.Start(context.Background()))
 	time.Sleep(1500 * time.Millisecond)
 	require.NoError(t, srv.Stop(context.Background()))
-	require.Equal(t, int32(1), atomic.LoadInt32(&nestedRan))
+	require.Equal(t, int32(1), nestedRan.Load())
 }
 
 // TestServerPanicCatch verifies WithRecover() catches panics from each
@@ -210,9 +210,9 @@ func TestServerPanicCatch(t *testing.T) {
 		cronkratos.WithRecover(),
 	)
 
-	var fired int32
+	var fired atomic.Int32
 	rese.C1(srv.AddFunc("* * * * * *", func(_ context.Context, _ *cronkratos.Stage) {
-		atomic.AddInt32(&fired, 1)
+		fired.Add(1)
 		panic(erero.New("panic catch test"))
 	}))
 
@@ -220,5 +220,5 @@ func TestServerPanicCatch(t *testing.T) {
 	time.Sleep(2500 * time.Millisecond)
 	require.NoError(t, srv.Stop(context.Background()))
 
-	require.GreaterOrEqual(t, atomic.LoadInt32(&fired), int32(2))
+	require.GreaterOrEqual(t, fired.Load(), int32(2))
 }

@@ -1,7 +1,6 @@
 package cronkratos
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -37,17 +36,15 @@ func TestTaskGateConcurrent(t *testing.T) {
 			require.NoError(t, err)
 			job := c.Entry(id).Job
 			var runs sync.WaitGroup
-			runs.Add(1)
-			go func() { defer runs.Done(); job.Run() }()
+			runs.Go(job.Run)
 			select {
 			case <-entered:
 			case <-time.After(time.Second):
 				t.Fatal("task did not start")
 			}
 			var attempts sync.WaitGroup
-			for n := 0; n < 32; n++ {
-				attempts.Add(1)
-				go func() { defer attempts.Done(); job.Run() }()
+			for range 32 {
+				attempts.Go(job.Run)
 			}
 			done := make(chan struct{})
 			go func() { attempts.Wait(); close(done) }()
@@ -59,7 +56,7 @@ func TestTaskGateConcurrent(t *testing.T) {
 				}
 				require.EqualValues(t, 1, calls.Load())
 			} else {
-				for n := 0; n < 32; n++ {
+				for range 32 {
 					select {
 					case <-entered:
 					case <-time.After(time.Second):
@@ -79,9 +76,9 @@ func TestTaskGateConcurrent(t *testing.T) {
 }
 
 func TestTaskGateStartupAndSchedule(t *testing.T) {
-	var logs bytes.Buffer
+	logger, logs := newStableLogs()
 	c := cron.New()
-	srv := NewServer(c, slog.New(slog.NewTextHandler(&logs, nil)))
+	srv := NewServer(c, logger)
 	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	defer close(release)
 	var calls atomic.Int32
@@ -100,8 +97,8 @@ func TestTaskGateStartupAndSchedule(t *testing.T) {
 	}
 	c.Entry(id).Job.Run()
 	require.EqualValues(t, 1, calls.Load())
-	require.Contains(t, logs.String(), "cron task skipped")
-	require.Contains(t, logs.String(), "sample")
+	require.Equal(t, `level=INFO msg="cron task skipped" spec="0 0 * * *" name=sample elapsed=DURATION
+`, logs.String())
 	// A distinct registration with the same name has its own gate.
 	// 同名的不同注册项各有独立门控。
 	nextID, err := srv.AddFunc("0 0 * * *", func(context.Context, *Stage) { calls.Add(1) }, SkipIfRunning(), WithName("sample"))
@@ -119,9 +116,9 @@ func TestTaskGateStartupAndSchedule(t *testing.T) {
 }
 
 func TestTaskGatePanicRelease(t *testing.T) {
-	var logs bytes.Buffer
+	logger, logs := newStableLogs()
 	c := cron.New()
-	srv := NewServer(c, slog.New(slog.NewTextHandler(&logs, nil)), WithRecover())
+	srv := NewServer(c, logger, WithRecover())
 	var calls int
 	id, err := srv.AddFunc("0 0 * * *", func(context.Context, *Stage) {
 		calls++
@@ -131,6 +128,7 @@ func TestTaskGatePanicRelease(t *testing.T) {
 	c.Entry(id).Job.Run()
 	c.Entry(id).Job.Run()
 	require.Equal(t, 2, calls)
-	require.Contains(t, logs.String(), "panic-case")
-	require.Contains(t, logs.String(), "stack=")
+	require.Equal(t, `level=ERROR msg="cron task panic" spec="0 0 * * *" name=panic-case reason=boom stack=STACK
+level=ERROR msg="cron task panic" spec="0 0 * * *" name=panic-case reason=boom stack=STACK
+`, logs.String())
 }

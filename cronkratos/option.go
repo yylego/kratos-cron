@@ -40,8 +40,9 @@ type taskConfig struct {
 	skipRunning bool
 }
 
-// WithName sets the business name used in task logs.
-// WithName 设置任务日志中的业务名称，不作为互斥键。
+// WithName sets the business name used in task logs; SkipIfRunning does not use it to match runs.
+//
+// WithName 设置任务日志中的业务名称，不作为 SkipIfRunning 的互斥键。
 func WithName(name string) TaskOption {
 	return func(c *taskConfig) { c.name = name }
 }
@@ -50,6 +51,7 @@ func WithName(name string) TaskOption {
 // Startup and scheduled runs share the same gate. Active work continues unchanged.
 // Runs skipped during active work are not queued. Direct calls to the business
 // function bypass this gate. Tasks must join spawned goroutines.
+//
 // SkipIfRunning 跳过同一注册项在当前进程内的重叠执行。
 // 启动执行和定时执行共用门控，不取消正在运行的任务，也不跨进程互斥。
 // 被跳过的执行不排队补跑；直接调用业务函数不经过门控。

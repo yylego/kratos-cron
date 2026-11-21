@@ -19,10 +19,10 @@ type Stage struct {
 // NewStage builds a Stage on the given sync.Locker.
 // Server uses NewStage(mutex.RLocker()) inside; on-demand paths that
 // bypass shutdown coordination should invoke NonStage instead.
+// Nested invocations sharing a lock must reuse the same Stage instance.
 //
 // NewStage 用给定的 sync.Locker 构造 Stage
 // Server 内部用 NewStage(mutex.RLocker()); 手动触发等不参与协调的路径请用 NonStage
-// Nested invocations sharing a lock must reuse the same Stage instance.
 // 同一把锁的嵌套调用应复用同一个 Stage，不复制或另建包装。
 func NewStage(rmu sync.Locker) *Stage {
 	return &Stage{rmu: rmu}
@@ -84,7 +84,7 @@ type stageHoldingTag struct{ stage *Stage }
 //	        }) {
 //	            return
 //	        }
-//	        if cronkratos.Sleep(ctx, pause) != nil { return }
+//	        if cronkratos.SleepContext(ctx, pause) != nil { return }
 //	    }
 //	})
 //
@@ -97,7 +97,7 @@ type stageHoldingTag struct{ stage *Stage }
 //	        }) {
 //	            return
 //	        }
-//	        if cronkratos.Sleep(ctx, pause) != nil { return }
+//	        if cronkratos.SleepContext(ctx, pause) != nil { return }
 //	    }
 //	})
 //
@@ -127,34 +127,15 @@ type stageHoldingTag struct{ stage *Stage }
 // 内层 RLock 等 Lock(), Lock() 等外层 RLock — 循环等待
 // ctx 标记让内层 Do 跳过加锁,直接绕开这个陷阱
 //
-// Panic semantics: Stage.Do does NOT deferred-recover panics raised inside
-// fn — these propagate out of Do (and out of cmd), where Server's
-// Recoverable() / WithRecover() can catch them. The read-lock is not
-// leaked on panic: Go runs deferred Unlock during panic stack-unwind,
-// releasing the read-lock as the panic propagates. Code past stage.Do in cmd
-// does NOT execute on panic (Go unwinds the stack), so no gap exists where
-// "panic was recovered upstream and business goes on as if it succeeded".
-// Use defer recover inside fn to handle panics as values yourself.
+// Panic: Do does not recover panics raised inside fn. Such panics propagate out of Do and cmd, where
+// Server's Recoverable() / WithRecover() catches them in one place, the same stance as
+// sync.Mutex / sync.RWMutex. The deferred Unlock runs during the unwind too, so the read-lock
+// is not leaked; the code past stage.Do does not run, so a panic cannot pass as a success.
+// Use defer recover inside fn to handle panics as values.
 //
-// panic 行为:Stage.Do 不内置 deferred recover — fn 内 panic 会 propagate
-// 出 Do (出 cmd), 由 Server 的 Recoverable() / WithRecover() 兜住
-// 锁不会泄漏:Go 在 panic 栈展开过程中仍会执行 defer 的 Unlock,锁正常释放
-// cmd 内 stage.Do 后面的代码在 panic 时不会执行 (Go panic 会 unwind 栈),
-// 所以"panic 被 recover 后业务以为成功"的坑不存在
-// 业务想把 panic 当值处理, 在 fn 内自己 defer recover 即可
-//
-// Design rationale: no built-in recover — panic propagation is the safe default,
-// letting it unwind out of cmd makes "business goes on as if it succeeded"
-// impossible (no code past the panic runs). Catching it via Server's
-// wrapRecoverable keeps panic handling in one place (at Server-side scope),
-// so Stage stays focused on lock semantics alone. Standard sync primitives
-// (sync.Mutex, sync.RWMutex) take the same stance — none catches panics.
-//
-// 设计取舍:Stage.Do 不内置 recover — panic 直接传播是更安全的默认行为,
-// 让 panic unwind 出 cmd, "业务以为成功"的坑根本不会出现 (panic 之后的代码不执行)
-// 由 Server 的 wrapRecoverable 统一兜 panic, 把 "panic 处理" 这件事集中在 Server 这一层,
-// Stage 保持专注于锁语义本身. Go 标准库的同步原语 (sync.Mutex / sync.RWMutex)
-// 也都是这个立场 — 不替调用方兜 panic
+// panic:Do 不替 fn 兜 panic，panic 会传出 Do 和 cmd，由 Server 的 Recoverable() / WithRecover()
+// 统一兜住，跟 sync.Mutex / sync.RWMutex 的立场一样。栈展开时 defer 的 Unlock 照常执行，读锁不会泄漏；
+// stage.Do 后面的代码不会执行，panic 不会被当成成功。想把 panic 当值处理，就在 fn 里自己 defer recover。
 func (s *Stage) Do(ctx context.Context, fn func(ctx context.Context)) bool {
 	if ctx.Err() != nil {
 		return false
@@ -173,13 +154,13 @@ func (s *Stage) Do(ctx context.Context, fn func(ctx context.Context)) bool {
 	return true
 }
 
-// Sleep waits d and returns nil; once ctx is done it returns ctx.Err() at once.
+// SleepContext waits d and returns nil; once ctx is done it returns ctx.Err() at once.
 // Call it between Stage.Do steps: inside Do, Stop waits on the step before
 // cancelling ctx, so a sleep there holds up shutdown to its end.
 //
-// Sleep 等待 d 后返回 nil；ctx 结束时立即返回 ctx.Err()。
+// SleepContext 等待 d 后返回 nil；ctx 结束时立即返回 ctx.Err()。
 // 放在两次 Stage.Do 之间调用：Do 内部的等待会让 Stop 一直等到它结束才取消 ctx。
-func Sleep(ctx context.Context, d time.Duration) error {
+func SleepContext(ctx context.Context, d time.Duration) error {
 	if cause := ctx.Err(); cause != nil {
 		return cause
 	}

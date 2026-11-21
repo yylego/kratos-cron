@@ -1,6 +1,6 @@
 // Package cronkratos integrates robfig/cron with the Kratos framework.
 //
-// Wraps cron as a Kratos transport.Server with first-class support of:
+// Wraps cron as a Kratos transport.Server with:
 //   - clean shutdown: finish protected steps, cancel ctx, then await task completion
 //   - opt-in panic catch via Recoverable() / WithRecover()
 //   - one-shot startup execution declared at task scope via AddFunc(..., DoOnStartup())
@@ -20,14 +20,14 @@
 //	// Bind a 2am task that should also run once at startup,
 //	// with panic catch so transient bugs do not crash the service.
 //	// stage.Do holds the read-lock so Stop waits—fn returns before cancelling ctx.
-//	rese.V1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
+//	rese.C1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
 //	    stage.Do(ctx, func(ctx context.Context) {
 //	        // business logic
 //	    })
 //	}, cronkratos.DoOnStartup(), cronkratos.Recoverable()))
 //
 //	// Bind a 3am task that runs just on schedule, no panic catch, no lock-coordination needed
-//	rese.V1(srv.AddFunc("0 0 3 * * *", func(ctx context.Context, stage *cronkratos.Stage) { ... }))
+//	rese.C1(srv.AddFunc("0 0 3 * * *", func(ctx context.Context, stage *cronkratos.Stage) { ... }))
 //
 // Else set service-side panic catch once and skip task-scope Recoverable():
 //
@@ -35,7 +35,7 @@
 //
 // cronkratos: 把 robfig/cron 跟 Kratos 框架集成
 //
-// 包成 Kratos transport.Server,一站式提供:
+// 包成 Kratos transport.Server,提供:
 //   - 优雅退出:等当前关键段完成,取消 ctx,再等任务返回
 //   - panic 兜底通过 Recoverable() / WithRecover() 显式启用
 //   - 启动跑一次:在 AddFunc 时通过 DoOnStartup() 选项声明,task 粒度配置
@@ -53,11 +53,14 @@
 //
 //	// 注册一个每天跑的任务,启动时也跑一次,带 panic 兜底防止偶发 bug 让进程崩
 //	// stage.Do 持读锁,Stop 会等 fn 返回再 cancel ctx
-//	rese.V1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
+//	rese.C1(srv.AddFunc("0 0 2 * * *", func(ctx context.Context, stage *cronkratos.Stage) {
 //	    stage.Do(ctx, func(ctx context.Context) {
 //	        // 业务逻辑
 //	    })
 //	}, cronkratos.DoOnStartup(), cronkratos.Recoverable()))
+//
+//	// 注册一个只按时间表跑的任务,不带 panic 兜底,也不需要跟 Stop 协调加锁
+//	rese.C1(srv.AddFunc("0 0 3 * * *", func(ctx context.Context, stage *cronkratos.Stage) { ... }))
 //
 //	// 或者构造时声明服务级 recover,task 级就不用每个写 Recoverable() 了:
 //	srv := cronkratos.NewServer(c, slog, cronkratos.WithRecover())
@@ -75,14 +78,13 @@ import (
 
 // Server is a Kratos transport.Server wrapping a cron schedule.
 // Construct via NewServer; do not zero-initialise.
+// Bind tasks before Start. Each instance supports one start/stop cycle.
+// Start and Stop are serialized; once stopped, an instance cannot restart.
 //
 // Server 是 Kratos transport.Server,封装 cron 调度器
 // 用 NewServer 构造,不要零值初始化
-// Bind tasks before Start. Each instance supports one start/stop cycle.
-// Start and Stop are serialized; once stopped, an instance cannot restart.
-// Registration must precede lifecycle operations.
 // 启动前完成任务注册；每个实例使用一次启动与停止流程。
-// Start 和 Stop 内部串行协调；停止后不再启动，注册须在生命周期操作前完成。
+// Start 和 Stop 内部串行协调；停止后不再启动。
 type Server struct {
 	cron        *cron.Cron
 	ctx         context.Context
@@ -147,9 +149,7 @@ func NewServer(c *cron.Cron, slog *slog.Logger, opts ...ServerOption) *Server {
 // Returns cron.EntryID plus the spec-parsing error from the underlying cron
 // package. The startup run (when present) is deferred to Server.Start().
 //
-// # AddFunc 注册定时任务
-//
-// 选项控制行为(全部 opt-in,没有隐式默认):
+// AddFunc 注册定时任务，选项控制行为(全部 opt-in,没有隐式默认):
 //   - Recoverable() 给这个 task 包 defer recover(panic -> 打日志 + 不崩进程)
 //   - DoOnStartup() 让 Server.Start() 时也跑一次
 //   - WithName(name) 在异常与跳过日志中包含业务名称
@@ -225,11 +225,7 @@ func (s *Server) Start(_ context.Context) error {
 	s.cron.Start()
 
 	for _, fn := range s.startupRuns {
-		s.startupDone.Add(1)
-		go func() {
-			defer s.startupDone.Done()
-			fn()
-		}()
+		s.startupDone.Go(fn)
 	}
 
 	if n := len(s.startupRuns); n > 0 {
